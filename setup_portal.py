@@ -5,8 +5,10 @@ import time
 
 app = Flask(__name__)
 
+# Путь к флагу (тот же, что и в bridge.py)
+FLAG_PATH = "/home/yerniyaz/Desktop/vector/.first_run_completed"
+
 def get_wifi_list():
-    # Принудительный рескан и получение списка
     subprocess.run('nmcli device wifi rescan', shell=True)
     time.sleep(2)
     cmd = "nmcli -t -f SSID,SIGNAL device wifi list | sort -u -t: -k1,1"
@@ -16,7 +18,7 @@ def get_wifi_list():
     for line in res.stdout.split('\n'):
         if line.strip() and ':' in line:
             ssid, signal = line.split(':')
-            if ssid: # Игнорируем скрытые сети без имени
+            if ssid:
                 networks.append({'ssid': ssid, 'signal': signal})
     return networks
 
@@ -31,13 +33,11 @@ def setup():
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         
         if res.returncode == 0:
-            flag_path = "/home/yerniyaz/Desktop/vector/.first_run_completed"
-            with open(flag_path, "w") as f: f.write("done")
+            with open(FLAG_PATH, "w") as f: f.write("done")
             return "<h1>УСПЕШНО!</h1><p>Зеркало подключается к сети...</p>"
         else:
             return f"<h1>ОШИБКА</h1><p>{res.stderr}</p><a href='/'>НАЗАД</a>"
 
-    # GET запрос: показываем список сетей
     networks = get_wifi_list()
     
     html = '''
@@ -88,22 +88,15 @@ def setup():
     '''
     return render_template_string(html, networks=networks)
 
-# Добавь этот роут в свой файл setup_portal.py
-# Добавь этот роут в setup_portal.py перед if __name__ == '__main__':
-
 @app.route('/status')
 def status():
-    flag_path = "/home/yerniyaz/Desktop/vector/.first_run_completed"
-    # Если файла НЕТ — значит первый запуск, нужно настраивать
-    needs_setup = not os.path.exists(flag_path)
-    
+    # Если файла НЕТ — значит нужно настраивать (needs_setup: true)
+    needs_setup = not os.path.exists(FLAG_PATH)
     return {
         "needs_setup": needs_setup,
         "ip": "10.42.0.1",
         "port": 8081
     }
-    
-    
+
 if __name__ == '__main__':
-    # Убедись, что порт 8081
     app.run(host='0.0.0.0', port=8081)
