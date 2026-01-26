@@ -89,19 +89,23 @@ def reset_wifi():
         if os.path.exists(FLAG_PATH):
             os.remove(FLAG_PATH)
         
-        # 2. Удаляем сохраненные Wi-Fi (безопасный метод)
-        # Ищем UUID всех беспроводных сетей
-        cmd_get_uuids = "nmcli -t -f UUID,TYPE connection show | grep 802-11-wireless | cut -d: -f1"
+        # 2. Удаляем сохраненные Wi-Fi (кроме профиля Hotspot)
+        # Получаем список всех UUID, кроме того, который отвечает за Hotspot
+        cmd_get_uuids = "nmcli -t -f UUID,TYPE,NAME connection show | grep 802-11-wireless | grep -v 'Hotspot' | cut -d: -f1"
         uuids = subprocess.check_output(cmd_get_uuids, shell=True, text=True).strip().split('\n')
         
         for uuid in uuids:
-            if uuid: # Если нашли хоть один UUID
+            if uuid:
                 subprocess.run(f"nmcli connection delete {uuid}", shell=True)
         
-        return jsonify({"status": "success", "message": "Wi-Fi settings cleared"}), 200
+        # 3. Принудительно поднимаем Hotspot, чтобы точка доступа появилась сразу
+        # Если профиль Hotspot уже настроен в системе:
+        subprocess.run("nmcli connection up Hotspot", shell=True)
+        
+        return jsonify({"status": "success", "message": "Wi-Fi settings cleared, Hotspot starting"}), 200
     except Exception as e:
-        # Если сетей нет, nmcli может выдать ошибку, но нам важно, чтобы флаг FLAG_PATH был удален
-        return jsonify({"status": "success", "message": "Cleared with warnings"}), 200
-
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+    
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5005, debug=False)
