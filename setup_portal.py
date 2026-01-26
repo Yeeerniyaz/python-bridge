@@ -88,5 +88,11 @@ def setup():
     '''
     return render_template_string(html, networks=networks)
 
+    @app.route('/status')
+def status():
+    # Проверяем наличие файла-флага
+    flag_exists = os.path.exists("/home/yerniyaz/Desktop/vector/.first_run_completed")
+    return {"connected": flag_exists}
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8081)
