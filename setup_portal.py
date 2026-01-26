@@ -5,31 +5,20 @@ import time
 
 app = Flask(__name__)
 
-HTML = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>VECTOR Setup</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { background: #000; color: #ff8c00; font-family: sans-serif; text-align: center; padding: 20px; }
-        input { padding: 15px; margin: 10px 0; width: 85%; border: 1px solid #333; background: #111; color: #fff; border-radius: 5px; font-size: 16px; }
-        button { background: #ff8c00; border: none; padding: 15px; width: 90%; font-weight: bold; cursor: pointer; border-radius: 5px; margin-top: 10px; }
-        .status { margin: 20px; padding: 10px; border-radius: 5px; display: none; }
-    </style>
-</head>
-<body>
-    <h1 style="letter-spacing: 5px;">VECTOR OS</h1>
-    <p>НАСТРОЙКА СЕТИ</p>
-    <form method="POST">
-        <input type="text" name="ssid" placeholder="Название Wi-Fi (SSID)" required spellcheck="false"><br>
-        <input type="password" name="password" placeholder="Пароль" required><br>
-        <button type="submit">ПОДКЛЮЧИТЬ</button>
-    </form>
-    <p style="font-size: 12px; color: #555; mt: 20px;">Убедитесь, что зеркало находится в зоне действия роутера.</p>
-</body>
-</html>
-'''
+def get_wifi_list():
+    # Принудительный рескан и получение списка
+    subprocess.run('nmcli device wifi rescan', shell=True)
+    time.sleep(2)
+    cmd = "nmcli -t -f SSID,SIGNAL device wifi list | sort -u -t: -k1,1"
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    
+    networks = []
+    for line in res.stdout.split('\n'):
+        if line.strip() and ':' in line:
+            ssid, signal = line.split(':')
+            if ssid: # Игнорируем скрытые сети без имени
+                networks.append({'ssid': ssid, 'signal': signal})
+    return networks
 
 @app.route('/', methods=['GET', 'POST'])
 def setup():
@@ -38,30 +27,66 @@ def setup():
         pw = request.form['password'].strip()
         
         print(f"Попытка подключения к {ssid}...")
-        
-        # 1. Сначала пробуем просто пересканировать
-        subprocess.run('nmcli device wifi rescan', shell=True)
-        time.sleep(3)
-        
-        # 2. Попытка подключения
-        # Добавляем --wait 10, чтобы nmcli дольше искал сеть перед тем как сдаться
         cmd = f'nmcli --wait 15 device wifi connect "{ssid}" password "{pw}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         
         if res.returncode == 0:
-            # Успех: создаем файл-флаг
             flag_path = "/home/yerniyaz/Desktop/vector/.first_run_completed"
-            with open(flag_path, "w") as f:
-                f.write("done")
-            return "<h1>УСПЕШНО!</h1><p>Зеркало подключается. Подождите 10 секунд...</p>"
+            with open(flag_path, "w") as f: f.write("done")
+            return "<h1>УСПЕШНО!</h1><p>Зеркало подключается к сети...</p>"
         else:
-            # Если не нашел, пробуем принудительно через 'nmcli d wifi connect' еще раз
-            # Иногда помогает указать интерфейс явно
-            print(f"Первая попытка не удалась: {res.stderr}")
-            return f"<h1>ОШИБКА</h1><p>Сеть '{ssid}' не найдена или пароль неверный. Попробуйте еще раз, убедившись в правильности имени (регистр важен!)</p><a href='/' style='color:orange'>НАЗАД</a>"
-            
-            
-    return render_template_string(HTML)
+            return f"<h1>ОШИБКА</h1><p>{res.stderr}</p><a href='/'>НАЗАД</a>"
+
+    # GET запрос: показываем список сетей
+    networks = get_wifi_list()
+    
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>VECTOR Setup</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { background: #000; color: #ff8c00; font-family: sans-serif; text-align: center; padding: 20px; }
+            .net-item { background: #111; border: 1px solid #333; padding: 15px; margin: 10px 0; border-radius: 8px; cursor: pointer; display: flex; justify-content: space-between; }
+            .net-item:hover { border-color: #ff8c00; }
+            input { padding: 15px; margin: 10px 0; width: 85%; border: 1px solid #333; background: #111; color: #fff; border-radius: 5px; font-size: 16px; }
+            button { background: #ff8c00; border: none; padding: 15px; width: 90%; font-weight: bold; border-radius: 5px; }
+            #pwd-form { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); padding-top: 50px; }
+        </style>
+    </head>
+    <body>
+        <h1>VECTOR OS</h1>
+        <p>ВЫБЕРИТЕ ВАШ WI-FI:</p>
+        {% for net in networks %}
+            <div class="net-item" onclick="selectNet('{{ net.ssid }}')">
+                <span>{{ net.ssid }}</span>
+                <span style="color: #555;">{{ net.signal }}%</span>
+            </div>
+        {% endfor %}
+        <button onclick="location.reload()" style="background: #222; color: #fff; margin-top: 20px;">ОБНОВИТЬ СПИСОК</button>
+
+        <div id="pwd-form">
+            <h2 id="selected-ssid"></h2>
+            <form method="POST">
+                <input type="hidden" name="ssid" id="ssid-input">
+                <input type="password" name="password" placeholder="Пароль" required autofocus>
+                <button type="submit">ПОДКЛЮЧИТЬ</button>
+                <button type="button" onclick="document.getElementById('pwd-form').style.display='none'" style="background:none; color:gray; margin-top:10px;">ОТМЕНА</button>
+            </form>
+        </div>
+
+        <script>
+            function selectNet(ssid) {
+                document.getElementById('ssid-input').value = ssid;
+                document.getElementById('selected-ssid').innerText = ssid;
+                document.getElementById('pwd-form').style.display = 'block';
+            }
+        </script>
+    </body>
+    </html>
+    '''
+    return render_template_string(html, networks=networks)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
