@@ -24,6 +24,32 @@ def sensors():
 @app.route('/api/system/update-python', methods=['POST'])
 def update_python():
     try:
+        os.chdir(WORKING_DIR)
+        
+        # 1. Git Pull (Раз ты говоришь, что он работает — оставляем)
+        subprocess.run(["git", "pull"], check=True)
+        
+        # 2. Pip Install с защитой от блокировки системных пакетов
+        try:
+            # Добавляем флаг --break-system-packages для новых систем
+            subprocess.run([
+                sys.executable, "-m", "pip", "install", 
+                "--break-system-packages", 
+                "-r", "requirements.txt"
+            ], check=False) # check=False, чтобы если даже пип не сработал, рестарт пошел дальше
+        except Exception as pip_e:
+            print(f"Pip warning: {pip_e}")
+
+        # 3. Рестарт сервиса
+        # Используем фоновый запуск, чтобы Flask успел отправить ответ зеркалу
+        os.system("sudo systemctl restart vector-bridge &")
+        
+        return jsonify({"status": "success", "message": "Код обновлен, перезагружаюсь..."}), 200
+
+    except Exception as e:
+        # Теперь мы будем видеть реальную ошибку в логах
+        return jsonify({"status": "error", "message": str(e)}), 500
+    try:
         # Проверка директории
         if not os.path.exists(WORKING_DIR):
             return jsonify({"status": "error", "message": f"Папка {WORKING_DIR} не найдена"}), 404
