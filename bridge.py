@@ -27,22 +27,30 @@ def sensors():
 @app.route('/api/system/update-python', methods=['POST'])
 def update_python():
     try:
-        # 1. Переходим в нужную папку
+        # 1. Проверяем, существует ли папка вообще
+        if not os.path.exists(WORKING_DIR):
+            return jsonify({"status": "error", "message": f"Folder {WORKING_DIR} not found"}), 404
+
         os.chdir(WORKING_DIR)
         
-        # 2. Обновляем код из Git
-        subprocess.run(["git", "pull"], check=True)
+        # 2. Обновляем код (с захватом ошибок)
+        pull_res = subprocess.run(["git", "pull"], capture_output=True, text=True)
+        if pull_res.returncode != 0:
+            return jsonify({"status": "error", "message": f"Git Pull failed: {pull_res.stderr}"}), 500
         
-        # 3. Установка новых библиотек из requirements.txt
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], check=True)
+        # 3. Установка библиотек
+        pip_res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], capture_output=True, text=True)
+        if pip_res.returncode != 0:
+            return jsonify({"status": "error", "message": f"Pip Install failed: {pip_res.stderr}"}), 500
         
-        # 4. Перезагружаем сервис через systemd
+        # 4. Перезагрузка
+        # Важно: используем sudo только если настроен passwordless sudo для systemctl
         os.system("sudo systemctl restart vector-bridge &")
         
-        return jsonify({"status": "success", "message": "Code updated, restarting..."}), 200
+        return jsonify({"status": "success", "message": "Updated successfully. Restarting..."}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-
+    
 @app.route('/api/system/reset-wifi', methods=['POST'])
 def reset_wifi():
     try:
