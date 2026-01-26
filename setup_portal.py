@@ -5,7 +5,6 @@ import time
 
 app = Flask(__name__)
 
-# Путь к флагу (тот же, что и в bridge.py)
 FLAG_PATH = "/home/yerniyaz/Desktop/vector/.first_run_completed"
 
 def get_wifi_list():
@@ -28,7 +27,6 @@ def setup():
         ssid = request.form['ssid'].strip()
         pw = request.form['password'].strip()
         
-        print(f"Попытка подключения к {ssid}...")
         cmd = f'nmcli --wait 15 device wifi connect "{ssid}" password "{pw}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         
@@ -90,7 +88,6 @@ def setup():
 
 @app.route('/status')
 def status():
-    # Если файла НЕТ — значит нужно настраивать (needs_setup: true)
     needs_setup = not os.path.exists(FLAG_PATH)
     return {
         "needs_setup": needs_setup,

@@ -2,17 +2,20 @@ import os
 import subprocess
 import sys
 import shutil
+import time
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
+# Пути
 WORKING_DIR = "/home/yerniyaz/Desktop/vector/python"
 FLAG_PATH = "/home/yerniyaz/Desktop/vector/.first_run_completed"
 
 def read_sensors():
     try:
+        # Твой код датчиков
         return {"temp": 25.5, "hum": 40, "co2": 999, "status": "online"}
     except Exception as e:
         return {"temp": "--", "hum": "--", "co2": "--", "status": "offline"}
@@ -24,88 +27,55 @@ def sensors():
 @app.route('/api/system/update-python', methods=['POST'])
 def update_python():
     try:
+        if not os.path.exists(WORKING_DIR):
+            return jsonify({"status": "error", "message": "Папка не найдена"}), 404
+        
         os.chdir(WORKING_DIR)
         
-        # 1. Git Pull (Раз ты говоришь, что он работает — оставляем)
+        # 1. Git Pull
         subprocess.run(["git", "pull"], check=True)
         
-        # 2. Pip Install с защитой от блокировки системных пакетов
+        # 2. Pip Install (с флагом для новых систем)
         try:
-            # Добавляем флаг --break-system-packages для новых систем
             subprocess.run([
                 sys.executable, "-m", "pip", "install", 
-                "--break-system-packages", 
-                "-r", "requirements.txt"
-            ], check=False) # check=False, чтобы если даже пип не сработал, рестарт пошел дальше
-        except Exception as pip_e:
-            print(f"Pip warning: {pip_e}")
+                "--break-system-packages", "-r", "requirements.txt"
+            ], check=False)
+        except:
+            pass
 
-        # 3. Рестарт сервиса
-        # Используем фоновый запуск, чтобы Flask успел отправить ответ зеркалу
+        # 3. Рестарт сервиса в фоне
         os.system("sudo systemctl restart vector-bridge &")
         
         return jsonify({"status": "success", "message": "Код обновлен, перезагружаюсь..."}), 200
-
-    except Exception as e:
-        # Теперь мы будем видеть реальную ошибку в логах
-        return jsonify({"status": "error", "message": str(e)}), 500
-    try:
-        # Проверка директории
-        if not os.path.exists(WORKING_DIR):
-            return jsonify({"status": "error", "message": f"Папка {WORKING_DIR} не найдена"}), 404
-        
-        os.chdir(WORKING_DIR)
-
-        # 1. Git Pull
-        # Фикс: перед pull делаем fetch, чтобы проверить связь
-        process = subprocess.run(["git", "pull"], capture_output=True, text=True)
-        if process.returncode != 0:
-            return jsonify({
-                "status": "error", 
-                "message": f"Git Error: {process.stderr if process.stderr else 'Конфликт локальных файлов'}"
-            }), 500
-
-        # 2. Pip Install
-        pip_process = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
-            capture_output=True, text=True
-        )
-        if pip_process.returncode != 0:
-            return jsonify({"status": "error", "message": f"Pip Error: {pip_process.stderr}"}), 500
-
-        # 3. Рестарт сервиса
-        # Используем фоновый запуск, чтобы Flask успел отдать ответ 200 до того, как его убьют
-        os.system("sudo systemctl restart vector-bridge &")
-        
-        return jsonify({"status": "success", "message": "Обновление завершено, рестарт..."}), 200
-
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/system/reset-wifi', methods=['POST'])
 def reset_wifi():
     try:
-        # 1. Удаляем флаг завершения настройки
+        # 1. Удаляем флаг
         if os.path.exists(FLAG_PATH):
             os.remove(FLAG_PATH)
         
-        # 2. Удаляем сохраненные Wi-Fi (кроме профиля Hotspot)
-        # Получаем список всех UUID, кроме того, который отвечает за Hotspot
-        cmd_get_uuids = "nmcli -t -f UUID,TYPE,NAME connection show | grep 802-11-wireless | grep -v 'Hotspot' | cut -d: -f1"
-        uuids = subprocess.check_output(cmd_get_uuids, shell=True, text=True).strip().split('\n')
+        # 2. Удаляем все Wi-Fi кроме Hotspot
+        cmd = "nmcli -t -f UUID,TYPE,NAME connection show | grep 802-11-wireless | grep -v 'Hotspot' | cut -d: -f1"
+        try:
+            uuids = subprocess.check_output(cmd, shell=True, text=True).strip().split('\n')
+            for uuid in uuids:
+                if uuid:
+                    subprocess.run(f"sudo nmcli connection delete {uuid}", shell=True)
+        except:
+            pass
+
+        # 3. ПЕРЕЗАПУСК СЕТИ (чтобы точка доступа точно заработала)
+        os.system("sudo systemctl restart NetworkManager")
+        time.sleep(2)
+        subprocess.run("sudo nmcli connection up Hotspot", shell=True)
         
-        for uuid in uuids:
-            if uuid:
-                subprocess.run(f"nmcli connection delete {uuid}", shell=True)
-        
-        # 3. Принудительно поднимаем Hotspot, чтобы точка доступа появилась сразу
-        # Если профиль Hotspot уже настроен в системе:
-        subprocess.run("nmcli connection up Hotspot", shell=True)
-        
-        return jsonify({"status": "success", "message": "Wi-Fi settings cleared, Hotspot starting"}), 200
+        return jsonify({"status": "success", "message": "Wi-Fi reset, Hotspot starting"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-    
-    
+
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5005, debug=False)
