@@ -89,12 +89,21 @@ def setup():
     return render_template_string(html, networks=networks)
 
 # Добавь этот роут в свой файл setup_portal.py
+# Добавь этот роут в setup_portal.py перед if __name__ == '__main__':
+
 @app.route('/status')
 def status():
-    # Если файл-флаг существует, значит интернет настроен
-    flag_exists = os.path.exists("/home/yerniyaz/Desktop/vector/.first_run_completed")
-    return {"connected": flag_exists}
-
+    flag_path = "/home/yerniyaz/Desktop/vector/.first_run_completed"
+    # Если файла НЕТ — значит первый запуск, нужно настраивать
+    needs_setup = not os.path.exists(flag_path)
+    
+    return {
+        "needs_setup": needs_setup,
+        "ip": "10.42.0.1",
+        "port": 8081
+    }
+    
+    
 if __name__ == '__main__':
     # Убедись, что порт 8081
     app.run(host='0.0.0.0', port=8081)
