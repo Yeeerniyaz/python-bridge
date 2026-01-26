@@ -49,6 +49,7 @@ def reset_wifi():
         # 1. Удаляем флаг завершения настройки
         if os.path.exists(FLAG_PATH):
             os.remove(FLAG_PATH)
+            
         
         # 2. Удаляем сохраненные Wi-Fi соединения через nmcli
         cmd = "nmcli --fields UUID,TYPE connection show | grep 802-11-wireless | awk '{print $1}' | xargs nmcli connection delete"
