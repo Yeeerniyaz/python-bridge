@@ -60,6 +60,7 @@ def setup():
             print(f"Первая попытка не удалась: {res.stderr}")
             return f"<h1>ОШИБКА</h1><p>Сеть '{ssid}' не найдена или пароль неверный. Попробуйте еще раз, убедившись в правильности имени (регистр важен!)</p><a href='/' style='color:orange'>НАЗАД</a>"
             
+            
     return render_template_string(HTML)
 
 if __name__ == '__main__':
