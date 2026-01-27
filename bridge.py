@@ -71,6 +71,7 @@ def update_python():
         return jsonify({"status": "error", "message": str(e)}), 500
     
     
+    
 @app.route('/api/system/reboot', methods=['POST'])
 def reboot():
     """Перезагрузка Raspberry Pi"""
