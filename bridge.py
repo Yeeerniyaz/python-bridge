@@ -2,55 +2,71 @@ import os
 import subprocess
 import sys
 import time
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
+# Путь к рабочей директории
 WORKING_DIR = "/home/yerniyaz/Desktop/vector/python"
-FLAG_PATH = "/home/yerniyaz/Desktop/vector/.first_run_completed"
 
 @app.route('/api/sensors', methods=['GET'])
 def sensors():
-    return jsonify({"temp": 25.5, "hum": 40, "co2": 999, "status": "online"})
+    """Чтение данных с датчиков (заглушка)"""
+    return jsonify({
+        "temp": 25.5, 
+        "hum": 40, 
+        "co2": 999, 
+        "status": "online"
+    })
 
-@app.route('/api/system/restart-app', methods=['POST'])
-def restart_app():
-    # Отправляем ответ и через секунду перезапускаем сервис
-    os.system("sleep 1 && sudo systemctl restart vector-app &")
-    return jsonify({"status": "success"}), 200
+@app.route('/api/wifi/list', methods=['GET'])
+def list_wifi():
+    """Сканирование доступных Wi-Fi сетей"""
+    try:
+        # Принудительное сканирование
+        subprocess.run('sudo nmcli device wifi rescan', shell=True)
+        time.sleep(2)
+        
+        # Получение списка SSID и уровня сигнала
+        cmd = "nmcli -t -f SSID,SIGNAL device wifi list | sort -u -t: -k1,1"
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        networks = []
+        for line in res.stdout.split('\n'):
+            if line.strip() and ':' in line:
+                ssid, signal = line.split(':')
+                if ssid:
+                    networks.append({'ssid': ssid, 'signal': signal})
+        return jsonify(networks)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/wifi/connect', methods=['POST'])
+def connect_wifi():
+    """Подключение к выбранной Wi-Fi сети"""
+    data = request.json
+    ssid = data.get('ssid')
+    password = data.get('password')
+    try:
+        # Попытка подключения
+        cmd = f'sudo nmcli device wifi connect "{ssid}" password "{password}"'
+        subprocess.run(cmd, shell=True, check=True)
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/system/reboot', methods=['POST'])
 def reboot():
-    # Полная перезагрузка малинки
-    os.system("sleep 1 && sudo reboot &")
-    return jsonify({"status": "success"}), 200
-
-@app.route('/api/system/reset-wifi', methods=['POST'])
-def reset_wifi():
+    """Полная перезагрузка системы Raspberry Pi"""
     try:
-        if os.path.exists(FLAG_PATH):
-            os.remove(FLAG_PATH)
-        
-        # Полная очистка всех Wi-Fi соединений (кроме Hotspot)
-        cmd = "nmcli -t -f UUID,TYPE connection show | grep 802-11-wireless | grep -v 'Hotspot' | cut -d: -f1"
-        try:
-            uuids = subprocess.check_output(cmd, shell=True, text=True).strip().split('\n')
-            for uuid in uuids:
-                if uuid:
-                    subprocess.run(f"sudo nmcli connection delete {uuid}", shell=True)
-        except:
-            pass
-
-        # Рестарт сети и активация точки доступа
-        os.system("sudo systemctl restart NetworkManager")
-        time.sleep(2)
-        os.system("sudo nmcli connection up Hotspot &")
-        
+        # Задержка 1 сек, чтобы Flask успел отправить ответ
+        os.system("sleep 1 && sudo reboot &")
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5005)
+    # Запуск сервера на порту 5005
+    app.run(host='0.0.0.0', port=5005, debug=False)
