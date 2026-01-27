@@ -54,23 +54,23 @@ def connect_wifi():
 
 @app.route('/api/system/update-python', methods=['POST'])
 def update_python():
-    """Обновление кода через Git Pull"""
+    """Обновление кода и датчиков"""
     try:
-        if not os.path.exists(WORKING_DIR):
-            return jsonify({"status": "error", "message": "Папка не найдена"}), 404
-        
+        # Переходим в папку с кодом
         os.chdir(WORKING_DIR)
         
-        # 1. Загрузка изменений из Git
+        # 1. Скачиваем свежий код из GitHub
         subprocess.run(["git", "pull"], check=True)
         
-        # 2. Перезапуск сервиса моста в фоне
+        # 2. Перезапускаем сервис (фоновый процесс)
+        # Мы используем nohup или & чтобы Flask успел вернуть ответ "success"
         os.system("sleep 1 && sudo systemctl restart vector-bridge &")
         
-        return jsonify({"status": "success", "message": "Код обновлен, перезапуск..."}), 200
+        return jsonify({"status": "success", "message": "Code updated"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-
+    
+    
 @app.route('/api/system/reboot', methods=['POST'])
 def reboot():
     """Перезагрузка Raspberry Pi"""
