@@ -1,85 +1,173 @@
-import os
-import subprocess
-import sys
-import time
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import { useState, useEffect } from "react";
+import { Box, Progress, Text, MantineProvider } from "@mantine/core";
+import { useMirrorData } from "./hooks/useMirrorData";
 
-app = Flask(__name__)
-CORS(app)
+import { Dashboard } from "./pages/Dashboard";
+import { Hub } from "./pages/Hub";
+import { Settings } from "./pages/Settings";
 
-# Путь к директории проекта
-WORKING_DIR = "/home/yerniyaz/Desktop/vector/python"
+// Electron IPC (если запущен в Electron)
+const ipc = window.require ? window.require("electron").ipcRenderer : null;
 
-@app.route('/api/sensors', methods=['GET'])
-def sensors():
-    """Получение данных с датчиков"""
-    return jsonify({
-        "temp": 25.5, 
-        "hum": 40, 
-        "co2": 999, 
-        "status": "online"
-    })
+export default function App() {
+  const [page, setPage] = useState(0);
+  
+  // Достаем данные и функции Wi-Fi из нашего хука
+  const { 
+    time, 
+    sensors, 
+    weather, 
+    news, 
+    updStatus, 
+    updProgress, 
+    appVersion, 
+    setUpdStatus,
+    fetchData,
+    wifiList,        // Список сетей
+    getWifiList,     // Функция сканирования
+    connectToWifi    // Функция подключения
+  } = useMirrorData();
 
-@app.route('/api/wifi/list', methods=['GET'])
-def list_wifi():
-    """Сканирование доступных Wi-Fi сетей"""
-    try:
-        subprocess.run('sudo nmcli device wifi rescan', shell=True)
-        time.sleep(2)
-        cmd = "nmcli -t -f SSID,SIGNAL device wifi list | sort -u -t: -k1,1"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        networks = []
-        for line in res.stdout.split('\n'):
-            if line.strip() and ':' in line:
-                ssid, signal = line.split(':')
-                if ssid:
-                    networks.append({'ssid': ssid, 'signal': signal})
-        return jsonify(networks)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+  // Системные команды Electron
+  const launch = (data, type, isTV = false) => ipc?.send("launch", { data, type, isTV });
+  const updateMirror = () => ipc?.send("check-for-updates");
 
-@app.route('/api/wifi/connect', methods=['POST'])
-def connect_wifi():
-    """Подключение к Wi-Fi"""
-    data = request.json
-    ssid = data.get('ssid')
-    password = data.get('password')
-    try:
-        cmd = f'sudo nmcli device wifi connect "{ssid}" password "{password}"'
-        subprocess.run(cmd, shell=True, check=True)
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+  // Универсальная функция отправки команд на Python-бэкенд (5005)
+  const sendCmd = async (endpoint) => {
+    setUpdStatus(`ВЫПОЛНЕНИЕ: ${endpoint.toUpperCase()}...`);
+    try {
+      const res = await fetch(`http://127.0.0.1:5005/api/system/${endpoint}`, { 
+        method: "POST" 
+      });
+      if (res.ok) {
+        setUpdStatus("УСПЕШНО");
+      } else {
+        setUpdStatus("ОШИБКА СЕРВЕРА");
+      }
+    } catch (e) {
+      setUpdStatus("СВЯЗЬ ПОТЕРЯНА");
+    }
+    setTimeout(() => setUpdStatus(""), 3000);
+  };
 
-@app.route('/api/system/update-python', methods=['POST'])
-def update_python():
-    """Обновление кода и датчиков"""
-    try:
-        # Переходим в папку с кодом
-        os.chdir(WORKING_DIR)
+  // Обновление Python-части (Git Pull + Датчики)
+  const updatePython = async () => {
+    setUpdStatus("ОБНОВЛЕНИЕ СИСТЕМЫ..."); // Статус на экране
+    try {
+      const res = await fetch("http://127.0.0.1:5005/api/system/update-python", { 
+        method: "POST" 
+      });
+
+      if (res.ok) {
+        setUpdStatus("КОД ЗАГРУЖЕН. ПЕРЕЗАПУСК...");
         
-        # 1. Скачиваем свежий код из GitHub
-        subprocess.run(["git", "pull"], check=True)
-        
-        # 2. Перезапускаем сервис (фоновый процесс)
-        # Мы используем nohup или & чтобы Flask успел вернуть ответ "success"
-        os.system("sleep 1 && sudo systemctl restart vector-bridge &")
-        
-        return jsonify({"status": "success", "message": "Code updated"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-    
-    
-    
-@app.route('/api/system/reboot', methods=['POST'])
-def reboot():
-    """Перезагрузка Raspberry Pi"""
-    try:
-        os.system("sleep 1 && sudo reboot &")
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        // Вежливая пауза 4 секунды, чтобы bridge.py успел перезагрузиться
+        setTimeout(async () => {
+          try {
+            await fetchData(); // Обновляем данные с новых датчиков
+            setUpdStatus("СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА");
+          } catch (err) {
+            setUpdStatus("ДАТЧИКИ ЕЩЕ СПЯТ");
+          }
+          setTimeout(() => setUpdStatus(""), 2000);
+        }, 4000);
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5005, debug=False)
+      } else {
+        setUpdStatus("ОШИБКА ОБНОВЛЕНИЯ");
+        setTimeout(() => setUpdStatus(""), 3000);
+      }
+    } catch (e) {
+      setUpdStatus("БРИДЖ НЕ ОТВЕЧАЕТ");
+      setTimeout(() => setUpdStatus(""), 3000);
+    }
+  };
+
+  // Навигация клавишами
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === "ArrowRight") setPage((p) => Math.min(p + 1, 2));
+      if (e.key === "ArrowLeft") setPage((p) => Math.max(p - 1, 0));
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  return (
+    <MantineProvider defaultColorScheme="dark">
+      <Box style={{ 
+        backgroundColor: "#000", 
+        height: "100vh", 
+        width: "100vw", 
+        overflow: "hidden", 
+        color: "white",
+        // ГЛАВНАЯ ФИШКА: Скрываем курсор только на 0 странице (Dashboard)
+        cursor: page === 0 ? "none" : "default" 
+      }}>
+
+        {/* СТРОГИЙ ИНДИКАТОР СТАТУСА */}
+        {updStatus && (
+          <Box style={{ 
+            position: "fixed", 
+            top: 40, 
+            left: "50%", 
+            transform: "translateX(-50%)", 
+            zIndex: 10000, 
+            width: 320, 
+            background: "rgba(5,5,5,0.95)", 
+            padding: "20px", 
+            border: "1px solid #111", 
+            borderRadius: "4px" 
+          }}>
+            <Text size="xs" fw={900} mb={updProgress > 0 ? 10 : 0} ta="center" style={{ letterSpacing: "3px" }}>
+              {updStatus.toUpperCase()}
+            </Text>
+            {updProgress > 0 && <Progress value={updProgress} color="white" size="xs" animated />}
+          </Box>
+        )}
+
+        {/* КОНТЕЙНЕР СЛАЙДОВ (Dashboard -> Hub -> Settings) */}
+        <Box style={{ 
+          display: "flex", 
+          width: "300vw", 
+          height: "100vh", 
+          transition: "transform 0.8s cubic-bezier(0.16, 1, 0.3, 1)", 
+          transform: `translateX(-${page * 100}vw)` 
+        }}>
+          {/* Слайд 0: Главный экран (без мышки) */}
+          <Dashboard time={time} weather={weather} sensors={sensors} news={news} />
+          
+          {/* Слайд 1: Меню приложений (с мышкой) */}
+          <Hub launch={launch} />
+          
+          {/* Слайд 2: Настройки (с мышкой) */}
+          <Settings 
+            sendCmd={sendCmd} 
+            updateMirror={updateMirror} 
+            updatePython={updatePython} 
+            appVersion={appVersion}
+            wifiList={wifiList}
+            getWifiList={getWifiList}
+            connectToWifi={connectToWifi}
+          />
+        </Box>
+
+        {/* МИНИМАЛИСТИЧНЫЕ ТОЧКИ ПАГИНАЦИИ */}
+        <Box style={{ position: "fixed", bottom: 40, left: "50%", transform: "translateX(-50%)", zIndex: 100 }}>
+          <div style={{ display: "flex", gap: "15px" }}>
+            {[0, 1, 2].map((i) => (
+              <Box key={i} style={{ 
+                width: i === page ? 25 : 8, 
+                height: 8, 
+                borderRadius: 4, 
+                backgroundColor: i === page ? "white" : "#111", 
+                border: i === page ? "none" : "1px solid #222",
+                transition: "all 0.4s ease" 
+              }} />
+            ))}
+          </div>
+        </Box>
+
+      </Box>
+    </MantineProvider>
+  );
+}
