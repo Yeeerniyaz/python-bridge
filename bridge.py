@@ -2,141 +2,193 @@ import asyncio
 import json
 import threading
 import time
+import os
+import logging
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from bleak import BleakClient, BleakScanner
 
-# --- НАСТРОЙКИ ---
+# ===========================
+# ⚙️ НАСТРОЙКИ (CONFIG)
+# ===========================
+
+# Имя устройства ESP32 (должно совпадать с прошивкой)
 DEVICE_NAME = "VECTOR_ESP32"
 
-# UUID (Должны совпадать с прошивкой ESP32)
+# UUID сервисов и характеристик (из твоего main.py на ESP32)
 SENSOR_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 LED_CHAR_UUID    = "82258ba0-0557-4303-91ca-00dcc5703003"
 
-# Глобальные переменные
-latest_sensors = {"temp": "--", "hum": "--", "co2": "--"}
-ble_client = None
-ble_loop = asyncio.new_event_loop()
-connection_event = asyncio.Event()
-
-app = Flask(__name__)
-CORS(app) # Разрешаем запросы от React
+# Порт, на котором будет работать API для Electron
+API_PORT = 5005
 
 # ===========================
-# 🌐 FLASK API (Для Electron)
+# 📦 ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ===========================
+
+# Здесь храним последние данные, чтобы отдавать их мгновенно
+latest_sensors = {
+    "temp": 0, 
+    "hum": 0, 
+    "co2": 0, 
+    "status": "waiting..."
+}
+
+ble_client = None  # Объект клиента Bluetooth
+ble_loop = asyncio.new_event_loop() # Отдельный цикл для Bluetooth
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger("VECTOR")
+
+# Инициализация Flask
+app = Flask(__name__)
+CORS(app) # Разрешаем запросы от React приложения
+
+# ===========================
+# 🌐 API ENDPOINTS (FLASK)
 # ===========================
 
 @app.route('/api/sensors', methods=['GET'])
 def get_sensors():
-    """Отдает зеркалу последние данные с датчиков"""
+    """
+    Electron запрашивает этот адрес каждые 3 секунды.
+    Мы отдаем последние данные, полученные от ESP32.
+    """
     return jsonify(latest_sensors)
 
 @app.route('/api/led', methods=['POST'])
 def control_led():
-    """Принимает команды для ленты и шлет их в ESP32"""
+    """
+    Electron отправляет сюда команды управления лентой.
+    Пример JSON: {"mode": "RAINBOW", "bright": 0.5, "speed": 50}
+    """
     global ble_client
-    
-    # Получаем JSON от Electron (например: {"mode": "RAINBOW", "speed": 50})
     command = request.json
-    print(f"🌍 Получена команда API: {command}")
+    logger.info(f"🌍 API: Получена команда для ленты: {command}")
     
     if ble_client and ble_client.is_connected:
         try:
-            # Превращаем JSON в строку байтов для ESP32
+            # Превращаем JSON в байты и отправляем в очередь BLE
             payload = json.dumps(command).encode('utf-8')
             
-            # Отправляем в BLE-поток
-            future = asyncio.run_coroutine_threadsafe(
+            # Безопасно вызываем асинхронную функцию из синхронного Flask
+            asyncio.run_coroutine_threadsafe(
                 ble_client.write_gatt_char(LED_CHAR_UUID, payload),
                 ble_loop
             )
-            future.result(timeout=2) # Ждем подтверждения отправки
-            return jsonify({"status": "sent", "cmd": command})
+            return jsonify({"status": "success", "cmd": command})
         except Exception as e:
-            print(f"❌ Ошибка отправки BLE: {e}")
+            logger.error(f"❌ Ошибка отправки BLE: {e}")
             return jsonify({"status": "error", "message": str(e)}), 500
     else:
-        print("⚠️ ESP32 не подключена!")
+        logger.warning("⚠️ Команда пропущена: ESP32 не подключена")
         return jsonify({"status": "offline"}), 503
 
 @app.route('/system/reboot', methods=['POST'])
-def reboot_system():
-    """Перезагрузка самой Малины (на всякий случай)"""
-    import os
+def system_reboot():
+    """Перезагрузка Raspberry Pi"""
+    logger.warning("🔄 Получена команда перезагрузки системы")
     os.system('sudo reboot')
     return jsonify({"status": "rebooting"})
 
+@app.route('/system/shutdown', methods=['POST'])
+def system_shutdown():
+    """Выключение Raspberry Pi"""
+    logger.warning("🛑 Получена команда выключения системы")
+    os.system('sudo shutdown -h now')
+    return jsonify({"status": "shutting_down"})
+
 # ===========================
-# 🦷 BLUETOOTH ЛОГИКА (Bleak)
+# 🦷 BLUETOOTH ЛОГИКА (BLEAK)
 # ===========================
 
-def sensor_callback(sender, data):
-    """Обработка входящих данных от ESP32"""
+def sensor_notification_handler(sender, data):
+    """
+    Эта функция вызывается АВТОМАТИЧЕСКИ, когда ESP32 присылает данные.
+    """
     global latest_sensors
     try:
-        # Декодируем байты в строку, потом в JSON
-        json_str = data.decode('utf-8')
-        latest_sensors = json.loads(json_str)
-        # print(f"📡 Датчики: {latest_sensors}") # Раскомментируй для отладки
+        decoded_data = data.decode('utf-8')
+        sensor_json = json.loads(decoded_data)
+        
+        # Обновляем глобальную переменную
+        latest_sensors.update(sensor_json)
+        latest_sensors["status"] = "online"
+        
+        # logger.info(f"📡 Данные от ESP32: {sensor_json}") # Раскомментируй для отладки
     except Exception as e:
-        print(f"❌ Ошибка парсинга датчиков: {e}")
+        logger.error(f"❌ Ошибка парсинга JSON от ESP32: {e}")
 
 async def ble_manager():
-    """Главный цикл управления Bluetooth"""
+    """
+    Главный цикл управления Bluetooth.
+    Занимается поиском, подключением и переподключением.
+    """
     global ble_client
     
-    print("🦷 Запуск BLE менеджера...")
+    logger.info("🦷 Запуск BLE менеджера...")
     
     while True:
         try:
             # 1. Поиск устройства
-            print(f"🔍 Ищу {DEVICE_NAME}...")
+            logger.info(f"🔍 Сканирую эфир в поисках {DEVICE_NAME}...")
             device = await BleakScanner.find_device_by_filter(
                 lambda d, ad: d.name == DEVICE_NAME,
                 timeout=10.0
             )
             
             if not device:
-                print("⚠️ Устройство не найдено, повтор через 5 сек...")
+                logger.warning("⚠️ Устройство не найдено. Повтор через 5 сек...")
+                latest_sensors["status"] = "searching..."
                 await asyncio.sleep(5)
                 continue
 
             # 2. Подключение
-            print(f"🔗 Подключаюсь к {device.address}...")
+            logger.info(f"🔗 Обнаружено! Подключаюсь к {device.address}...")
+            
             async with BleakClient(device, timeout=10.0) as client:
                 ble_client = client
                 
-                # Подписываемся на обновления датчиков
-                await client.start_notify(SENSOR_CHAR_UUID, sensor_callback)
-                print(f"✅ УСПЕШНО ПОДКЛЮЧЕНО! Жду данные...")
+                # Подписываемся на характеристику датчиков
+                await client.start_notify(SENSOR_CHAR_UUID, sensor_notification_handler)
                 
-                # Держим соединение активным
+                logger.info(f"✅ УСПЕШНО ПОДКЛЮЧЕНО! Жду данные...")
+                latest_sensors["status"] = "connected"
+                
+                # Отправляем приветственный сигнал (опционально)
+                # await client.write_gatt_char(LED_CHAR_UUID, b'{"mode":"STATIC","color":[0,255,0]}')
+
+                # Бесконечный цикл, пока соединение живое
                 while client.is_connected:
                     await asyncio.sleep(1)
                 
-                print("🔌 Соединение разорвано")
+                logger.warning("🔌 Соединение разорвано (Bluetooth disconnect)")
                 ble_client = None
+                latest_sensors["status"] = "disconnected"
 
         except Exception as e:
-            print(f"🧨 Ошибка BLE цикла: {e}")
+            logger.error(f"🧨 Критическая ошибка BLE: {e}")
             ble_client = None
-            await asyncio.sleep(5) # Пауза перед реконнектом
+            latest_sensors["status"] = "error"
+            await asyncio.sleep(5) # Пауза перед новой попыткой
 
 # ===========================
-# 🚀 ЗАПУСК
+# 🚀 ЗАПУСК (MAIN)
 # ===========================
 
 def start_ble_loop(loop):
-    """Запуск asyncio в отдельном потоке"""
+    """Функция для запуска asyncio в отдельном потоке"""
     asyncio.set_event_loop(loop)
     loop.run_until_complete(ble_manager())
 
 if __name__ == '__main__':
-    # 1. Запускаем Bluetooth в фоне
+    # 1. Запускаем Bluetooth в фоновом потоке
+    # (Это нужно, потому что Flask блокирует основной поток)
     ble_thread = threading.Thread(target=start_ble_loop, args=(ble_loop,), daemon=True)
     ble_thread.start()
     
-    # 2. Запускаем Flask сервер (блокирует основной поток)
-    print("🚀 Bridge API запущен на порту 5005")
-    # host='0.0.0.0' делает сервер доступным для локальной сети и контейнеров
-    app.run(host='0.0.0.0', port=5005, debug=False, use_reloader=False)
+    # 2. Запускаем веб-сервер Flask
+    logger.info(f"🚀 VECTOR BRIDGE запущен на порту {API_PORT}")
+    # host='0.0.0.0' делает API доступным для всех устройств в сети (важно для docker)
+    app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False)
