@@ -4,3 +4,4 @@ rpi_ws281x
 adafruit-circuitpython-ahtx0
 adafruit-circuitpython-ens160
 adafruit-blinka
+bleak
