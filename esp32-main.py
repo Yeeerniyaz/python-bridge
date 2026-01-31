@@ -1,12 +1,13 @@
-import bluetooth, machine, neopixel, json, time, random, gc
+import bluetooth, machine, neopixel, json, time, random, os
 from machine import Pin, I2C
 import ahtx0, ens160 
 
-# --- НАСТРОЙКИ ---
+# --- КОНСТАНТЫ ---
 PIN_LED = 4
 PIN_SDA = 21
 PIN_SCL = 22
-DEFAULT_LEDS = 30 
+DEFAULT_LEDS = 300 # <--- ТЕПЕРЬ 300 ПО УМОЛЧАНИЮ
+CONFIG_FILE = "config.json" 
 
 # Bluetooth UUIDs
 _SERVICE_UUID = bluetooth.UUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
@@ -14,7 +15,7 @@ _CHAR_SENSOR  = (bluetooth.UUID("beb5483e-36e1-4688-b7f5-ea07361b26a8"), bluetoo
 _CHAR_LED     = (bluetooth.UUID("82258ba0-0557-4303-91ca-00dcc5703003"), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
 _SERVICE      = (_SERVICE_UUID, (_CHAR_SENSOR, _CHAR_LED),)
 
-# --- КЛАСС УПРАВЛЕНИЯ ЛЕНТОЙ ---
+# --- КЛАСС ЛЕНТЫ ---
 class VectorLed:
     def __init__(self, pin, num):
         self.pin = pin
@@ -31,6 +32,7 @@ class VectorLed:
         if new_num != self.num:
             self.num = new_num
             self.np = neopixel.NeoPixel(Pin(self.pin), self.num)
+            print(f"✨ Лента пересобрана: {self.num} LEDs")
 
     def wheel(self, pos):
         if pos < 85: return (pos * 3, 255 - pos * 3, 0)
@@ -74,57 +76,83 @@ class VectorLed:
             self.step += 1
         self.np.write()
 
-# --- ОСНОВНОЙ КЛАСС СИСТЕМЫ ---
+# --- СИСТЕМА ---
 class VectorSystem:
     def __init__(self):
-        print("⚡ Инициализация...")
+        print("⚡ Инициализация VECTOR...")
         
-        # 1. I2C и Диагностика
-        self.i2c = I2C(0, scl=Pin(PIN_SCL), sda=Pin(PIN_SDA), freq=100000)
-        time.sleep(1) # Даем датчикам проснуться после подачи питания
+        # 1. Загрузка конфига
+        self.config = self.load_config()
         
-        # Сканируем шину перед запуском драйверов
-        devices = self.i2c.scan()
-        print(f"🔍 I2C Сканирование: {[hex(d) for d in devices]}")
+        # ХАК: Если в памяти записано старое число (30), меняем на 300
+        if self.config.get("leds", 0) < DEFAULT_LEDS:
+             print("🔄 Обновляю старый конфиг до 300 LED...")
+             self.config["leds"] = DEFAULT_LEDS
+             self.led_num = DEFAULT_LEDS
+             self.save_config() # Перезаписываем файл
+        else:
+             self.led_num = self.config.get("leds", DEFAULT_LEDS)
 
-        # 2. Подключаем AHT120
+        # 2. I2C и Датчики
+        self.i2c = I2C(0, scl=Pin(PIN_SCL), sda=Pin(PIN_SDA), freq=100000)
+        time.sleep(1)
+        devices = self.i2c.scan()
+        
         self.aht = None
         if 0x38 in devices:
-            try:
-                self.aht = ahtx0.AHT10(self.i2c)
-                print("✅ AHT120 подключен")
-            except Exception as e:
-                print(f"⚠️ Ошибка AHT: {e}")
-        else:
-            print("❌ AHT120 (0x38) не найден!")
-
-        # 3. Подключаем ENS160
+            try: self.aht = ahtx0.AHT10(self.i2c)
+            except: pass
+        
         self.ens = None
         if 0x53 in devices:
-            try:
-                self.ens = ens160.ENS160(self.i2c)
-                print("✅ ENS160 подключен")
-            except Exception as e:
-                print(f"⚠️ Ошибка ENS: {e}")
-        else:
-            print("❌ ENS160 (0x53) не найден!")
+            try: self.ens = ens160.ENS160(self.i2c)
+            except: pass
 
-        # 4. Лента
-        self.led = VectorLed(PIN_LED, DEFAULT_LEDS)
+        # 3. Лента
+        self.led = VectorLed(PIN_LED, self.led_num)
+        # Восстанавливаем настройки
+        self.led.mode = self.config.get("mode", "RAINBOW")
+        self.led.speed = self.config.get("speed", 50)
+        self.led.bright = self.config.get("bright", 0.8)
+        if "color" in self.config:
+            self.led.color = tuple(self.config["color"])
 
-        # 5. Bluetooth
+        # 4. Bluetooth
         self.ble = bluetooth.BLE()
         self.ble.active(True)
         self.ble.irq(self.ble_irq)
         ((self.h_sens, self.h_led),) = self.ble.gatts_register_services((_SERVICE,))
         self.advertise()
-        print("📡 VECTOR BLE STARTED")
+        print(f"📡 BLE STARTED (LEDs: {self.led.num})")
+
+    def load_config(self):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {"leds": DEFAULT_LEDS, "mode": "RAINBOW"}
+
+    def save_config(self):
+        data = {
+            "leds": self.led.num if hasattr(self, 'led') else DEFAULT_LEDS,
+            "mode": self.led.mode if hasattr(self, 'led') else "RAINBOW",
+            "speed": self.led.speed if hasattr(self, 'led') else 50,
+            "bright": self.led.bright if hasattr(self, 'led') else 0.8,
+            "color": self.led.color if hasattr(self, 'led') else (255,165,0)
+        }
+        # Если вызываем save до создания self.led (как в hack выше), используем self.config
+        if not hasattr(self, 'led'):
+             data.update(self.config)
+
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print("Save Err:", e)
 
     def ble_irq(self, event, data):
         if event == 1: print("🔗 Connected")
-        elif event == 2: 
-            print("📴 Disconnected -> Restarting Adv")
-            self.advertise()
+        elif event == 2: self.advertise()
         elif event == 3: 
             conn, handle = data
             if handle == self.h_led:
@@ -139,45 +167,43 @@ class VectorSystem:
         try:
             cmd = json.loads(data.decode())
             print("📩 CMD:", cmd)
+            save = False
+
             if "config" in cmd:
-                self.led.reconfig(cmd["config"].get("num", self.led.num))
-            self.led.mode = cmd.get("mode", self.led.mode)
-            self.led.color = tuple(cmd.get("color", self.led.color))
-            self.led.bright = cmd.get("bright", self.led.bright)
-            self.led.speed = cmd.get("speed", self.led.speed)
+                new_num = cmd["config"].get("num", self.led.num)
+                if new_num != self.led.num:
+                    self.led.reconfig(new_num)
+                    save = True
+            
+            if "mode" in cmd: self.led.mode = cmd["mode"]; save=True
+            if "color" in cmd: self.led.color = tuple(cmd["color"]); save=True
+            if "speed" in cmd: self.led.speed = cmd["speed"]; save=True
+            if "bright" in cmd: self.led.bright = cmd["bright"]; save=True
+                
+            if save: self.save_config()
         except: pass
 
     def loop(self):
         last_sensor_time = 0
         while True:
             self.led.tick()
-            
             now = time.ticks_ms()
             if time.ticks_diff(now, last_sensor_time) > 3000:
                 last_sensor_time = now
                 self.read_sensors()
-            
             time.sleep_ms(10)
 
     def read_sensors(self):
         t, h, co2 = 0, 0, 0
-        
-        # Читаем AHT
-        if self.aht:
-            try:
-                t, h = self.aht.read()
+        if self.aht: 
+            try: t, h = self.aht.read()
             except: pass
-            
-        # Читаем ENS
-        if self.ens:
-            try:
-                _, _, co2 = self.ens.read_all()
-                if co2 == 0: co2 = 400
+        if self.ens: 
+            try: _, _, co2 = self.ens.read_all()
             except: pass
-        
+        if co2 == 0: co2 = 400
         payload = json.dumps({"temp": round(t, 1), "hum": int(h), "co2": int(co2)})
-        try:
-            self.ble.gatts_notify(0, self.h_sens, payload)
+        try: self.ble.gatts_notify(0, self.h_sens, payload)
         except: pass 
 
 # ЗАПУСК
