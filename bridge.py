@@ -25,7 +25,7 @@ def load_global_config():
 config = load_global_config()
 
 # Параметры из конфига
-DEVICE_NAME = config.get("deviceId", "VECTOR_ESP32") # Твой ID теперь тут
+DEVICE_NAME = "VECTOR_ESP32"
 MQTT_BROKER = config.get("mqttBroker", "82.115.43.240")
 API_PORT    = 5005
 
