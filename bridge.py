@@ -25,11 +25,11 @@ def load_global_config():
 config = load_global_config()
 
 # Параметры из конфига
-DEVICE_NAME = "VECTOR_ESP32"
 MQTT_BROKER = config.get("mqttBroker", "82.115.43.240")
 API_PORT    = 5005
 
 # BLE UUIDs
+DEVICE_NAME = "VECTOR_ESP32"
 SENSOR_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 LED_CHAR_UUID    = "82258ba0-0557-4303-91ca-00dcc5703003"
 
