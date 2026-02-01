@@ -3,10 +3,12 @@ import sys
 import time
 
 MAC = "14:33:5C:C0:5C:BA"
+# Твои ручки из лога:
+NOTIFY_HANDLE = "0x0011" # Для включения потока данных (CCCD)
+WRITE_HANDLE = "0x0013"  # Для отправки команд (RX)
 
 def run_bridge():
-    print(f"🚀 [BRIDGE] VECTOR: Старт прослушки {MAC}...", file=sys.stderr)
-    # Запускаем gatttool в интерактивном режиме
+    print(f"🚀 [BRIDGE] VECTOR: Старт на Public {MAC}...", file=sys.stderr)
     child = pexpect.spawn(f"gatttool -b {MAC} -t public --interactive")
     
     try:
@@ -14,36 +16,31 @@ def run_bridge():
         child.sendline("connect")
         
         if child.expect(["Connection successful", pexpect.TIMEOUT], timeout=15) == 0:
-            print("✅ [BRIDGE] Соединение установлено!", file=sys.stderr)
+            print("✅ [BRIDGE] СОЕДИНЕНИЕ УСТАНОВЛЕНО!", file=sys.stderr)
             
-            # Пробуем включить уведомления на самых частых ручках для ESP32 (0x0012, 0x0011, 0x000e)
-            # Одна из них точно сработает
-            for h in ["0x0012", "0x0011", "0x000e", "0x002a"]:
-                child.sendline(f"char-write-req {h} 0100")
-                time.sleep(0.2)
+            # Активируем уведомления (пишем 0100 в ручку 0x0011)
+            print(f"📡 [BRIDGE] Активация TX (handle {NOTIFY_HANDLE})...", file=sys.stderr)
+            child.sendline(f"char-write-req {NOTIFY_HANDLE} 0100")
             
-            print("📡 [BRIDGE] Жду данные (JSON)...", file=sys.stderr)
+            print("📡 [BRIDGE] Жду JSON...", file=sys.stderr)
 
             while True:
-                # Ждем строку с данными
-                idx = child.expect(["Notification handle = 0x[0-9a-f]+ value: ", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                # Слушаем поток данных
+                idx = child.expect(["Notification handle = 0x0010 value: ", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
                 
                 if idx == 0:
                     hex_data = child.readline().decode().strip()
                     try:
-                        # Чистим hex и переводим в текст
-                        clean_hex = hex_data.replace(" ", "")
-                        bytes_data = bytes.fromhex(clean_hex)
+                        # Конвертируем HEX в текст (JSON)
+                        bytes_data = bytes.fromhex(hex_data.replace(" ", ""))
                         decoded = bytes_data.decode('utf-8').strip()
-                        
-                        if "{" in decoded: # Проверяем наличие JSON
-                            print(decoded)
+                        if "{" in decoded:
+                            print(decoded) # Этот вывод заберет Electron
                             sys.stdout.flush()
-                    except:
-                        pass
+                    except: pass
                 
                 if idx == 2:
-                    print("❌ [BRIDGE] Разрыв связи.", file=sys.stderr)
+                    print("❌ [BRIDGE] ESP32 отключилась.", file=sys.stderr)
                     break
         else:
             print("❌ [BRIDGE] Не удалось подключиться.", file=sys.stderr)
@@ -58,5 +55,6 @@ if __name__ == "__main__":
         try:
             run_bridge()
         except KeyboardInterrupt:
+            print("\n🛑 Мост остановлен.", file=sys.stderr)
             sys.exit(0)
-        time.sleep(2)
+        time.sleep(3)
