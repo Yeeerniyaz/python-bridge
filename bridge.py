@@ -1,14 +1,12 @@
 import pexpect
 import sys
 import time
-import re
 
 MAC = "14:33:5C:C0:5C:BA"
-# UUID твоего TX (из кода ESP32)
-TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 def run_bridge():
-    print(f"🚀 [BRIDGE] Подключение к {MAC}...", file=sys.stderr)
+    print(f"🚀 [BRIDGE] VECTOR: Старт прослушки {MAC}...", file=sys.stderr)
+    # Запускаем gatttool в интерактивном режиме
     child = pexpect.spawn(f"gatttool -b {MAC} -t public --interactive")
     
     try:
@@ -18,44 +16,37 @@ def run_bridge():
         if child.expect(["Connection successful", pexpect.TIMEOUT], timeout=15) == 0:
             print("✅ [BRIDGE] Соединение установлено!", file=sys.stderr)
             
-            # --- АВТОПОИСК HANDLE ---
-            print("🔍 [BRIDGE] Ищу ручку (handle) для данных...", file=sys.stderr)
-            child.sendline("char-desc")
-            child.expect(r"\[LE\]>", timeout=5)
+            # Пробуем включить уведомления на самых частых ручках для ESP32 (0x0012, 0x0011, 0x000e)
+            # Одна из них точно сработает
+            for h in ["0x0012", "0x0011", "0x000e", "0x002a"]:
+                child.sendline(f"char-write-req {h} 0100")
+                time.sleep(0.2)
             
-            # Ищем наш UUID в выводе char-desc
-            output = child.before.decode().lower()
-            match = re.search(r"handle:\s+(0x[0-9a-f]+),\s+uuid:\s+" + TX_UUID, output)
-            
-            if match:
-                # Нашли handle характеристики, для подписки обычно нужен следующий (+1)
-                base_handle = match.group(1)
-                notify_handle = hex(int(base_handle, 16) + 1)
-                print(f"🎯 [BRIDGE] Нашел! Характеристика: {base_handle}, Подписка: {notify_handle}", file=sys.stderr)
-                
-                # Команда на включение уведомлений
-                child.sendline(f"char-write-req {notify_handle} 0100")
-            else:
-                # Если не нашли, пробуем стандартные 0x0012 или 0x0003
-                print("⚠️ [BRIDGE] UUID не найден, пробую стандартный 0x0012", file=sys.stderr)
-                child.sendline("char-write-req 0x0012 0100")
-
-            print("📡 [BRIDGE] Жду JSON...", file=sys.stderr)
+            print("📡 [BRIDGE] Жду данные (JSON)...", file=sys.stderr)
 
             while True:
+                # Ждем строку с данными
                 idx = child.expect(["Notification handle = 0x[0-9a-f]+ value: ", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                
                 if idx == 0:
                     hex_data = child.readline().decode().strip()
                     try:
-                        bytes_data = bytes.fromhex(hex_data.replace(" ", ""))
+                        # Чистим hex и переводим в текст
+                        clean_hex = hex_data.replace(" ", "")
+                        bytes_data = bytes.fromhex(clean_hex)
                         decoded = bytes_data.decode('utf-8').strip()
-                        if decoded.startswith('{'):
+                        
+                        if "{" in decoded: # Проверяем наличие JSON
                             print(decoded)
                             sys.stdout.flush()
-                    except: pass
-                if idx == 2: break
+                    except:
+                        pass
+                
+                if idx == 2:
+                    print("❌ [BRIDGE] Разрыв связи.", file=sys.stderr)
+                    break
         else:
-            print("❌ [BRIDGE] Тайм-аут коннекта", file=sys.stderr)
+            print("❌ [BRIDGE] Не удалось подключиться.", file=sys.stderr)
             
     except Exception as e:
         print(f"⚠️ [BRIDGE] Ошибка: {e}", file=sys.stderr)
@@ -64,5 +55,8 @@ def run_bridge():
 
 if __name__ == "__main__":
     while True:
-        run_bridge()
-        time.sleep(5)
+        try:
+            run_bridge()
+        except KeyboardInterrupt:
+            sys.exit(0)
+        time.sleep(2)
