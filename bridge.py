@@ -13,7 +13,7 @@ from bleak import BleakClient, BleakScanner
 # ===========================
 
 # Имя устройства ESP32 (должно совпадать с прошивкой)
-DEVICE_NAME = "VECTOR_ESP32"
+DEVICE_NAME = "VECTOR_FINAL"
 
 # UUID сервисов и характеристик (из твоего main.py на ESP32)
 SENSOR_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
