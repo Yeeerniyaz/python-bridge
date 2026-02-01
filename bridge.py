@@ -1,64 +1,59 @@
-import asyncio
+import pexpect
 import sys
-from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
+import time
+import json
 
-DEVICE_NAME = "Vector_Sensor"
-UART_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+# Твои данные
+MAC = "14:33:5C:C0:5C:BA"
+# UUID для RX (куда слать команды)
+CHAR_UUID_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
-class VectorBridge:
-    def __init__(self):
-        self.client = None
+def run_bridge():
+    print(f"🚀 [BRIDGE] Запуск жесткого коннекта к {MAC}...", file=sys.stderr)
+    
+    # Запускаем интерактивный gatttool (самый стабильный метод для ESP32)
+    child = pexpect.spawn(f"gatttool -b {MAC} -t random --char-write-req -a 0x0001 -n 0100 --interactive")
+    
+    try:
+        child.expect("\[LE\]>", timeout=10)
+        print("🔍 [BRIDGE] Попытка подключения...", file=sys.stderr)
+        child.sendline("connect")
+        
+        # Ждем успешного подключения
+        child.expect("Connection successful", timeout=20)
+        print("✅ [BRIDGE] СОЕДИНЕНИЕ УСТАНОВЛЕНО!", file=sys.stderr)
 
-    def handle_disconnect(self, client):
-        print("\n📡 [BRIDGE] ESP32 разорвала соединение.", file=sys.stderr)
-
-    def notification_handler(self, characteristic, data):
-        try:
-            decoded = data.decode('utf-8').strip()
-            if decoded.startswith('{'):
-                print(decoded)
-                sys.stdout.flush()
-        except: pass
-
-    async def run(self):
         while True:
-            print(f"🔍 [BRIDGE] Поиск {DEVICE_NAME}...", file=sys.stderr)
-            # Ищем чуть дольше
-            device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15.0)
+            # Ждем уведомления от датчиков (Notification)
+            index = child.expect(["Notification handle = 0x[0-9a-f]+ value: ", pexpect.TIMEOUT, pexpect.EOF], timeout=5)
             
-            if not device:
-                await asyncio.sleep(2)
-                continue
-
-            print(f"🔵 [BRIDGE] Подключение к {device.address}...", file=sys.stderr)
+            if index == 0:
+                # Получаем hex-данные
+                hex_data = child.readline().decode().strip()
+                # Переводим hex в текст (JSON)
+                try:
+                    bytes_data = bytes.fromhex(hex_data.replace(" ", ""))
+                    decoded = bytes_data.decode('utf-8').strip()
+                    if decoded.startswith('{'):
+                        print(decoded)
+                        sys.stdout.flush()
+                except:
+                    pass
             
-            try:
-                # Настраиваем клиент с обработчиком разрыва
-                async with BleakClient(
-                    device, 
-                    timeout=30.0, 
-                    disconnected_callback=self.handle_disconnect
-                ) as client:
-                    
-                    print("✅ [BRIDGE] Соединение установлено! Ждем стабильности...", file=sys.stderr)
-                    # КРИТИЧНО: Даем ESP32 3 секунды просто "повисеть" перед опросом сервисов
-                    await asyncio.sleep(3.0)
-                    
-                    # Принудительный опрос сервисов
-                    services = await client.get_services()
-                    print(f"📂 [BRIDGE] Сервисы найдены. Поиск характеристик...", file=sys.stderr)
+            if index == 2:
+                print("❌ [BRIDGE] ESP32 отключилась.", file=sys.stderr)
+                break
 
-                    await client.start_notify(UART_TX_UUID, self.notification_handler)
-                    print("🚀 [BRIDGE] ПОТОК ДАННЫХ ПОШЕЛ!", file=sys.stderr)
-                    
-                    while client.is_connected:
-                        await asyncio.sleep(1)
-                        
-            except Exception as e:
-                print(f"⚠️ [BRIDGE] Сбой: {e}", file=sys.stderr)
-                await asyncio.sleep(5)
+    except Exception as e:
+        print(f"⚠️ [BRIDGE] Ошибка: {e}", file=sys.stderr)
+    finally:
+        child.close()
 
 if __name__ == "__main__":
-    bridge = VectorBridge()
-    asyncio.run(bridge.run())
+    while True:
+        try:
+            run_bridge()
+        except KeyboardInterrupt:
+            sys.exit(0)
+        print("🔄 [BRIDGE] Перезапуск через 5 секунд...", file=sys.stderr)
+        time.sleep(5)
