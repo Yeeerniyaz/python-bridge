@@ -1,4 +1,3 @@
-# Файл: vector_bridge.py
 import asyncio
 import json
 import threading
@@ -12,7 +11,8 @@ from bleak import BleakClient, BleakScanner
 # ===========================
 # ⚙️ НАСТРОЙКИ
 # ===========================
-TARGET_NAME = "VECTOR_ESP32"  # Теперь ищем только ПРАВИЛЬНОЕ имя
+# Ищем ВСЕ варианты имен, чтобы точно найти ESP32
+TARGET_DEVICE_NAMES = ["VECTOR_FINAL", "VECTOR_ESP32", "MPY ESP32"]
 
 SENSOR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 LED_UUID    = "82258ba0-0557-4303-91ca-00dcc5703003"
@@ -35,13 +35,17 @@ CORS(app)
 # 🛠 SELF-HEALING
 # ===========================
 def reset_bluetooth_service():
+    """Перезапуск Bluetooth для лечения 'зависаний' адаптера RPi."""
     logger.info("💀 SYSTEM: Перезапуск службы Bluetooth...")
-    os.system("sudo rfkill unblock bluetooth")
-    os.system("sudo systemctl restart bluetooth")
-    time.sleep(3)
-    os.system("sudo hciconfig hci0 up")
-    time.sleep(1)
-    logger.info("✅ Bluetooth Ready.")
+    try:
+        os.system("sudo rfkill unblock bluetooth")
+        os.system("sudo systemctl restart bluetooth")
+        time.sleep(3) # Ждем пока служба поднимется
+        os.system("sudo hciconfig hci0 up")
+        time.sleep(1)
+        logger.info("✅ Bluetooth Ready.")
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка сброса (нужен sudo): {e}")
 
 # ===========================
 # 🌐 API
@@ -92,55 +96,66 @@ async def ble_manager():
 
     while True:
         try:
-            # 1. ПОИСК
-            logger.info(f"🔍 Ищу {TARGET_NAME}...")
+            # 1. ПОИСК (SCAN)
+            logger.info("🔍 Сканирую эфир...")
             target = None
+            
+            # Сканируем 5 секунд
             devices = await BleakScanner.discover(timeout=5.0, adapter="hci0")
             
+            # Проверяем, есть ли среди найденных наши имена
             for d in devices:
-                if d.name == TARGET_NAME:
+                if d.name in TARGET_DEVICE_NAMES:
                     target = d
+                    logger.info(f"🎯 ЦЕЛЬ ОБНАРУЖЕНА: '{d.name}' [{d.address}]")
                     break
             
             if not target:
-                logger.warning("⚠️ Не найден. Повтор...")
+                logger.warning(f"⚠️ Vector не найден (всего вокруг: {len(devices)}). Повтор...")
                 latest_sensors["status"] = "searching..."
                 await asyncio.sleep(2)
                 continue
 
             # 2. ПОДКЛЮЧЕНИЕ (3 попытки)
             connected = False
-            for i in range(3):
+            for i in range(3): # Пробуем 3 раза
                 try:
                     logger.info(f"🔗 Попытка {i+1}/3 к {target.address}...")
                     client = BleakClient(target.address, timeout=15.0, adapter="hci0")
                     await client.connect()
+                    
                     if client.is_connected:
                         ble_client = client
                         connected = True
-                        logger.info("✅ ПОДКЛЮЧЕНО!")
+                        logger.info("✅ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ!")
                         break
                 except Exception as e:
                     logger.warning(f"⚠️ Сбой: {e}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1.5) # Даем ESP32 время отдышаться
             
             if not connected:
+                logger.error("🧨 Не удалось подключиться. Пробую искать заново...")
                 continue
 
             # 3. РАБОТА
             latest_sensors["status"] = "connected"
-            try: await client.start_notify(SENSOR_UUID, notify_handler)
-            except: pass
+            try: 
+                await client.start_notify(SENSOR_UUID, notify_handler)
+                logger.info("📡 Подписка на данные активна")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка подписки (но связь есть): {e}")
 
+            # Держим соединение пока оно живое
             while client.is_connected:
                 await asyncio.sleep(1)
 
-            logger.warning("🔌 Отключено")
+            logger.warning("🔌 Устройство отключилось")
             ble_client = None
             latest_sensors["status"] = "disconnected"
 
         except Exception as e:
-            logger.error(f"🧨 Ошибка: {e}")
+            logger.error(f"🧨 Критическая ошибка: {e}")
+            # Если совсем всё плохо - сбрасываем адаптер
             os.system("sudo hciconfig hci0 reset")
             await asyncio.sleep(5)
 
@@ -152,6 +167,7 @@ def start_ble_loop(loop):
     loop.run_until_complete(ble_manager())
 
 if __name__ == '__main__':
+    # Сброс Bluetooth при старте (Обязательно!)
     reset_bluetooth_service()
     
     t = threading.Thread(target=start_ble_loop, args=(ble_loop,), daemon=True)
