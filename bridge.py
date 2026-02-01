@@ -1,105 +1,55 @@
 import asyncio
-import logging
 import json
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import sys
 from bleak import BleakClient, BleakScanner
 
-# Настройки
-TARGET_NAME = "VECTOR_FINAL"
-UUID_SENS = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-UUID_LED  = "82258ba0-0557-4303-91ca-00dcc5703003"
+# UUID характеристики для записи (RX), которую мы создали на ESP32
+UART_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+UART_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+DEVICE_NAME = "Vector_Sensor"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] VECTOR: %(message)s")
-logger = logging.getLogger("GW")
+class VectorBridge:
+    def __init__(self):
+        self.client = None
 
-# Хранилище состояния
-state = {
-    "sensors": {"temp": 0, "hum": 0, "co2": 400},
-    "status": "booting",
-    "client": None,
-    "lock": asyncio.Lock()
-}
+    def notification_handler(self, characteristic, data):
+        """Читаем JSON от ESP32 и выводим в stdout"""
+        try:
+            decoded = data.decode('utf-8').strip()
+            if decoded.startswith('{'):
+                print(decoded) # Electron поймает это
+                sys.stdout.flush()
+        except: pass
 
-class LedCmd(BaseModel):
-    mode: str
-    color: list[int] | None = None
-    speed: int | None = None
-    bright: float | None = None
-
-async def bt_manager():
-    """Фоновый процесс, который вечно ищет и держит связь"""
-    logger.info("🚀 Bluetooth Manager Started")
-    
-    while True:
-        state["status"] = "scanning"
-        device = await BleakScanner.find_device_by_filter(
-            lambda d, ad: d.name and d.name == TARGET_NAME, timeout=10.0
-        )
-
+    async def run(self):
+        print(f"🔍 Поиск {DEVICE_NAME}...", file=sys.stderr)
+        device = await BleakScanner.find_device_by_name(DEVICE_NAME)
+        
         if not device:
-            logger.warning(f"❌ {TARGET_NAME} not found. Scan again...")
-            await asyncio.sleep(3)
-            continue
+            print("❌ Не нашел ESP32. Проверь питание.", file=sys.stderr)
+            return
 
-        logger.info(f"🔗 Connecting to {device.address}...")
-        
-        try:
-            async with BleakClient(device) as client:
-                state["client"] = client
-                state["status"] = "connected"
-                logger.info("✅ Connected!")
-
-                # Функция приема данных
-                def callback(sender, data):
-                    try:
-                        state["sensors"] = json.loads(data.decode())
-                    except: pass
-                
-                await client.start_notify(UUID_SENS, callback)
-
-                # Держим соединение, пока оно живо
-                while client.is_connected:
-                    await asyncio.sleep(1)
-                    
-        except Exception as e:
-            logger.error(f"⚠️ Connection Error: {e}")
-        
-        state["client"] = None
-        state["status"] = "disconnected"
-        logger.info("RESTARTING LOOP...")
-        await asyncio.sleep(2)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(bt_manager())
-    yield
-    task.cancel()
-
-app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-@app.get("/api/sensors")
-async def get_data():
-    return {"data": state["sensors"], "status": state["status"]}
-
-@app.post("/api/led")
-async def send_cmd(cmd: LedCmd):
-    client = state["client"]
-    if not client or not client.is_connected:
-        raise HTTPException(503, "Device not connected")
-    
-    async with state["lock"]:
-        try:
-            js = json.dumps(cmd.dict(exclude_none=True)).encode()
-            # write_gatt_char(char, data, response=False) для скорости
-            await client.write_gatt_char(UUID_LED, js, response=False)
-            return {"status": "ok"}
-        except Exception as e:
-            raise HTTPException(500, str(e))
+        async with BleakClient(device) as client:
+            self.client = client
+            print(f"✅ Подключено к {device.address}", file=sys.stderr)
+            
+            # Включаем прослушку данных
+            await client.start_notify(UART_TX_UUID, self.notification_handler)
+            
+            # Читаем команды из stdin (от Electron) и шлем на ESP32
+            loop = asyncio.get_event_loop()
+            while client.is_connected:
+                # Этот блок позволяет Electron отправлять команды через мост
+                if sys.stdin in sys.stdin: # Проверка входящих команд
+                    line = await loop.run_in_executor(None, sys.stdin.readline)
+                    if line:
+                        cmd = line.strip()
+                        await client.write_gatt_char(UART_RX_UUID, cmd.encode())
+                await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5005)
+    bridge = VectorBridge()
+    try:
+        asyncio.run(bridge.run())
+    except KeyboardInterrupt:
+        print("\n🛑 Мост остановлен.", file=sys.stderr)
