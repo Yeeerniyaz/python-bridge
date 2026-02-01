@@ -3,12 +3,10 @@ import sys
 import time
 
 MAC = "14:33:5C:C0:5C:BA"
-# Твои ручки из лога:
-NOTIFY_HANDLE = "0x0011" # Для включения потока данных (CCCD)
-WRITE_HANDLE = "0x0013"  # Для отправки команд (RX)
 
 def run_bridge():
-    print(f"🚀 [BRIDGE] VECTOR: Старт на Public {MAC}...", file=sys.stderr)
+    print(f"🚀 [BRIDGE] VECTOR: Пробую все ключи для {MAC}...", file=sys.stderr)
+    # Используем интерактивный режим, он стабильнее для удержания связи
     child = pexpect.spawn(f"gatttool -b {MAC} -t public --interactive")
     
     try:
@@ -18,32 +16,51 @@ def run_bridge():
         if child.expect(["Connection successful", pexpect.TIMEOUT], timeout=15) == 0:
             print("✅ [BRIDGE] СОЕДИНЕНИЕ УСТАНОВЛЕНО!", file=sys.stderr)
             
-            # Активируем уведомления (пишем 0100 в ручку 0x0011)
-            print(f"📡 [BRIDGE] Активация TX (handle {NOTIFY_HANDLE})...", file=sys.stderr)
-            child.sendline(f"char-write-req {NOTIFY_HANDLE} 0100")
+            # Список всех подозрительных ручек из твоего дампа
+            # 0x0011 - это CCCD для твоего TX
+            # 0x0009 - это CCCD для системного сервиса (иногда путается)
+            handles = ["0x0011", "0x0010", "0x0009"]
             
-            print("📡 [BRIDGE] Жду JSON...", file=sys.stderr)
+            for h in handles:
+                print(f"🔑 [BRIDGE] Пробую активировать {h}...", file=sys.stderr)
+                # Пробуем два разных способа записи
+                child.sendline(f"char-write-req {h} 0100")
+                time.sleep(0.3)
+                child.sendline(f"char-write-cmd {h} 0100")
+                time.sleep(0.3)
+
+            print("📡 [BRIDGE] Перехожу в режим прослушки (listen)...", file=sys.stderr)
+            child.sendline("listen")
 
             while True:
-                # Слушаем поток данных
-                idx = child.expect(["Notification handle = 0x0010 value: ", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                # Ждем ЛЮБОЕ уведомление от устройства
+                idx = child.expect(["Notification handle = 0x[0-9a-f]+ value: ", pexpect.TIMEOUT, pexpect.EOF], timeout=15)
                 
                 if idx == 0:
                     hex_data = child.readline().decode().strip()
+                    # Печатаем вообще всё, что прилетело, чтобы увидеть хоть что-то
+                    print(f"📦 [RAW]: {hex_data}", file=sys.stderr) 
+                    
                     try:
-                        # Конвертируем HEX в текст (JSON)
-                        bytes_data = bytes.fromhex(hex_data.replace(" ", ""))
-                        decoded = bytes_data.decode('utf-8').strip()
+                        clean_hex = hex_data.replace(" ", "")
+                        bytes_data = bytes.fromhex(clean_hex)
+                        decoded = bytes_data.decode('utf-8', errors='ignore').strip()
+                        
                         if "{" in decoded:
-                            print(decoded) # Этот вывод заберет Electron
+                            print(decoded)
                             sys.stdout.flush()
-                    except: pass
+                    except:
+                        pass
                 
                 if idx == 2:
-                    print("❌ [BRIDGE] ESP32 отключилась.", file=sys.stderr)
+                    print("❌ [BRIDGE] ESP32 отвалилась.", file=sys.stderr)
                     break
+                    
+                if idx == 1:
+                    # Если долго нет данных, пробуем еще раз "пнуть" подписку
+                    child.sendline("char-write-req 0x0011 0100")
         else:
-            print("❌ [BRIDGE] Не удалось подключиться.", file=sys.stderr)
+            print("❌ [BRIDGE] Тайм-аут подключения.", file=sys.stderr)
             
     except Exception as e:
         print(f"⚠️ [BRIDGE] Ошибка: {e}", file=sys.stderr)
@@ -55,6 +72,5 @@ if __name__ == "__main__":
         try:
             run_bridge()
         except KeyboardInterrupt:
-            print("\n🛑 Мост остановлен.", file=sys.stderr)
             sys.exit(0)
-        time.sleep(3)
+        time.sleep(5)
