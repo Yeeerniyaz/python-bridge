@@ -9,22 +9,20 @@ from flask_cors import CORS
 from bleak import BleakClient, BleakScanner
 
 # ===========================
-# ⚙️ НАСТРОЙКИ (УНИВЕРСАЛЬНЫЕ)
+# ⚙️ НАСТРОЙКИ
 # ===========================
 
-# Ищем ЛЮБОЕ из этих имен.
-# "MPY ESP32" - чтобы работало прямо сейчас.
-# "VECTOR_ESP32" - чтобы работало в будущем.
+# Ищем по именам (для совместимости)
 TARGET_DEVICE_NAMES = ["VECTOR_ESP32", "MPY ESP32"]
 
-# UUID (Те, что сейчас в твоей ESP32)
+# UUID (Должны совпадать с ESP32)
 SENSOR_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 LED_CHAR_UUID    = "82258ba0-0557-4303-91ca-00dcc5703003"
 
 API_PORT = 5005
 
 # ===========================
-# 📦 GLOBAL STATE
+# 📦 ГЛОБАЛЬНОЕ СОСТОЯНИЕ
 # ===========================
 
 latest_sensors = {"temp": 0, "hum": 0, "co2": 0, "status": "booting..."}
@@ -38,27 +36,24 @@ app = Flask(__name__)
 CORS(app)
 
 # ===========================
-# 🛠 СИСТЕМА (СБРОС ЗАВИСАНИЙ)
+# 🛠 СИСТЕМНЫЕ УТИЛИТЫ
 # ===========================
 
 def reset_bluetooth_service():
-    """
-    Перезапуск службы Bluetooth перед стартом.
-    Решает проблему, когда RPi не видит устройства после перезапуска скрипта.
-    """
-    logger.info("💀 SYSTEM: Перезапуск службы Bluetooth (BlueZ)...")
+    """Перезапуск BlueZ для лечения 'зависаний' адаптера RPi."""
+    logger.info("💀 SYSTEM: Перезапуск службы Bluetooth...")
     try:
         os.system("sudo rfkill unblock bluetooth")
         os.system("sudo systemctl restart bluetooth")
-        time.sleep(3) # Ждем, пока служба поднимется
+        time.sleep(3) # Даем службе подняться
         os.system("sudo hciconfig hci0 up")
         time.sleep(1)
-        logger.info("✅ SYSTEM: Bluetooth готов.")
+        logger.info("✅ SYSTEM: Bluetooth сброшен и готов.")
     except Exception as e:
-        logger.error(f"⚠️ Ошибка сброса (запусти с sudo): {e}")
+        logger.error(f"⚠️ Ошибка сброса (нужен sudo): {e}")
 
 # ===========================
-# 🌐 API
+# 🌐 API (FLASK)
 # ===========================
 
 @app.route('/api/sensors', methods=['GET'])
@@ -95,7 +90,7 @@ def system_shutdown():
     return jsonify({"status": "shutting_down"})
 
 # ===========================
-# 🦷 BLE MANAGER (ПОИСК ПО СПИСКУ ИМЕН)
+# 🦷 BLE MANAGER (BULLDOG MODE)
 # ===========================
 
 def sensor_notification_handler(sender, data):
@@ -109,64 +104,87 @@ def sensor_notification_handler(sender, data):
 
 async def ble_manager():
     global ble_client
-    logger.info("🦷 Служба VECTOR BLE запущена")
+    logger.info("🦷 VECTOR BLE Started")
     
     while True:
         try:
-            # 1. ПОИСК (SCAN)
-            logger.info("🔍 Ищу устройства (VECTOR_ESP32 или MPY ESP32)...")
+            # --- ЭТАП 1: ПОИСК (SCAN) ---
+            logger.info("🔍 Сканирование эфира...")
+            target_device = None
             
-            # Сканируем эфир 5 секунд
+            # Сканируем 5 секунд
             devices = await BleakScanner.discover(timeout=5.0, adapter="hci0")
             
-            # Ищем совпадение по имени
-            target_device = None
             for d in devices:
-                # Если имя устройства есть в нашем списке TARGET_DEVICE_NAMES
                 if d.name in TARGET_DEVICE_NAMES:
                     target_device = d
-                    logger.info(f"🎯 НАЙДЕНО: '{d.name}' [{d.address}]")
+                    logger.info(f"🎯 ЦЕЛЬ ОБНАРУЖЕНА: '{d.name}' [{d.address}]")
                     break
             
             if not target_device:
-                logger.warning(f"⚠️ Цель не найдена. (Вижу {len(devices)} других). Повтор...")
+                logger.warning(f"⚠️ Vector не найден (всего устройств: {len(devices)}). Повтор...")
                 latest_sensors["status"] = "searching..."
+                await asyncio.sleep(2)
+                continue
+
+            # --- ЭТАП 2: ПОДКЛЮЧЕНИЕ С ПОВТОРАМИ (RETRY LOGIC) ---
+            connected = False
+            
+            # Пробуем 3 раза, если с первого раза вылетит ошибка "failed to discover services"
+            for attempt in range(1, 4):
+                try:
+                    logger.info(f"🥊 Попытка подключения {attempt}/3 к {target_device.address}...")
+                    
+                    # Создаем клиента
+                    client = BleakClient(target_device.address, timeout=15.0, adapter="hci0")
+                    
+                    # Пытаемся соединиться
+                    await client.connect()
+                    
+                    if client.is_connected:
+                        ble_client = client
+                        connected = True
+                        logger.info("✅ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ!")
+                        break # Выходим из цикла попыток, так как всё ок
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Сбой подключения (попытка {attempt}): {e}")
+                    await asyncio.sleep(1.5) # Даем ESP32 отдышаться перед новой атакой
+            
+            if not connected:
+                logger.error("🧨 Не удалось подключиться после 3 попыток. Начинаю поиск заново.")
                 await asyncio.sleep(3)
                 continue
 
-            # 2. ПОДКЛЮЧЕНИЕ (CONNECT)
-            logger.info(f"🔗 Подключаюсь к {target_device.address}...")
+            # --- ЭТАП 3: РАБОТА (OPERATING) ---
+            latest_sensors["status"] = "connected"
             
-            async with BleakClient(target_device.address, timeout=15.0, adapter="hci0") as client:
-                ble_client = client
-                
-                if client.is_connected:
-                    logger.info(f"✅ УСПЕШНО ПОДКЛЮЧЕНО к {target_device.name}!")
-                    latest_sensors["status"] = "connected"
-                    
-                    # Подписка на уведомления
-                    try:
-                        await client.start_notify(SENSOR_CHAR_UUID, sensor_notification_handler)
-                    except Exception as e:
-                        logger.error(f"⚠️ Ошибка подписки (проверь UUID): {e}")
+            # Подписка
+            try:
+                await client.start_notify(SENSOR_CHAR_UUID, sensor_notification_handler)
+                logger.info("📡 Подписка на данные активна")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка подписки (но соединение есть): {e}")
 
-                    # Держим соединение
-                    while client.is_connected:
-                        await asyncio.sleep(1)
-                        
-                logger.warning("🔌 Устройство отключилось")
-                ble_client = None
-                latest_sensors["status"] = "disconnected"
+            # Держим цикл пока есть связь
+            while client.is_connected:
+                await asyncio.sleep(1)
+                
+            # Если вышли из цикла - значит дисконнект
+            logger.warning("🔌 Соединение разорвано. Перезапуск цикла...")
+            ble_client = None
+            latest_sensors["status"] = "disconnected"
 
         except Exception as e:
-            logger.error(f"🧨 Ошибка BLE: {e}")
+            logger.error(f"🔥 Критическая ошибка BLE менеджера: {e}")
             ble_client = None
             latest_sensors["status"] = "error"
-            # Если ошибка - немного ждем перед новой попыткой
+            # Если совсем беда - сбрасываем интерфейс
+            os.system("sudo hciconfig hci0 reset")
             await asyncio.sleep(5) 
 
 # ===========================
-# 🚀 ЗАПУСК
+# 🚀 MAIN
 # ===========================
 
 def start_ble_loop(loop):
@@ -174,13 +192,13 @@ def start_ble_loop(loop):
     loop.run_until_complete(ble_manager())
 
 if __name__ == '__main__':
-    # 1. Обязательный сброс службы (Fix зависания RPi)
+    # 1. Сброс системы Bluetooth (важно для RPi)
     reset_bluetooth_service()
 
-    # 2. Поток BLE
+    # 2. Запуск BLE в фоне
     ble_thread = threading.Thread(target=start_ble_loop, args=(ble_loop,), daemon=True)
     ble_thread.start()
     
-    # 3. Flask
-    logger.info(f"🚀 VECTOR SERVER running on {API_PORT}")
+    # 3. Запуск сервера API
+    logger.info(f"🚀 SERVER RUNNING: {API_PORT}")
     app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False)
