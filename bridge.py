@@ -11,7 +11,8 @@ from bleak import BleakClient, BleakScanner
 # ===========================
 # ⚙️ НАСТРОЙКИ
 # ===========================
-# Ищем ВСЕ варианты имен, чтобы точно найти ESP32
+# Список имен, которые мы ищем. 
+# VECTOR_FINAL - приоритет (твоя новая прошивка).
 TARGET_DEVICE_NAMES = ["VECTOR_FINAL", "VECTOR_ESP32", "MPY ESP32"]
 
 SENSOR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -19,7 +20,7 @@ LED_UUID    = "82258ba0-0557-4303-91ca-00dcc5703003"
 API_PORT = 5005
 
 # ===========================
-# 📦 STATE
+# 📦 GLOBAL STATE
 # ===========================
 latest_sensors = {"temp": 0, "hum": 0, "co2": 0, "status": "booting..."}
 ble_client = None
@@ -32,20 +33,23 @@ app = Flask(__name__)
 CORS(app)
 
 # ===========================
-# 🛠 SELF-HEALING
+# 🛠 СИСТЕМА (СБРОС ЗАВИСАНИЙ)
 # ===========================
 def reset_bluetooth_service():
-    """Перезапуск Bluetooth для лечения 'зависаний' адаптера RPi."""
+    """
+    Полная перезагрузка службы Bluetooth (BlueZ) перед стартом.
+    Это лечит 99% проблем, когда RPi "не видит" устройства.
+    """
     logger.info("💀 SYSTEM: Перезапуск службы Bluetooth...")
     try:
         os.system("sudo rfkill unblock bluetooth")
         os.system("sudo systemctl restart bluetooth")
-        time.sleep(3) # Ждем пока служба поднимется
+        time.sleep(3) # Ждем, пока служба поднимется
         os.system("sudo hciconfig hci0 up")
         time.sleep(1)
-        logger.info("✅ Bluetooth Ready.")
+        logger.info("✅ SYSTEM: Bluetooth сброшен и готов к бою.")
     except Exception as e:
-        logger.error(f"⚠️ Ошибка сброса (нужен sudo): {e}")
+        logger.error(f"⚠️ Ошибка сброса (запусти с sudo): {e}")
 
 # ===========================
 # 🌐 API
@@ -58,7 +62,8 @@ def get_sensors():
 def control_led():
     global ble_client
     cmd = request.json
-    logger.info(f"🌍 API: {cmd}")
+    logger.info(f"🌍 API CMD: {cmd}")
+    
     if ble_client and ble_client.is_connected:
         try:
             payload = json.dumps(cmd).encode('utf-8')
@@ -67,8 +72,10 @@ def control_led():
             )
             return jsonify({"status": "ok"})
         except Exception as e:
+            logger.error(f"❌ Send Error: {e}")
             return jsonify({"status": "error", "msg": str(e)}), 500
-    return jsonify({"status": "offline"}), 503
+    else:
+        return jsonify({"status": "offline"}), 503
 
 @app.route('/system/reboot', methods=['POST'])
 def system_reboot():
@@ -84,43 +91,49 @@ def system_shutdown():
 # 🦷 BLE MANAGER
 # ===========================
 def notify_handler(sender, data):
+    """Обработка входящих данных от ESP32"""
     global latest_sensors
     try:
-        latest_sensors.update(json.loads(data.decode('utf-8')))
+        decoded = data.decode('utf-8')
+        latest_sensors.update(json.loads(decoded))
         latest_sensors["status"] = "online"
-    except: pass
+        # logger.info(f"📡 DATA: {latest_sensors}") # Раскомментируй для отладки
+    except:
+        pass
 
 async def ble_manager():
     global ble_client
     logger.info("🦷 VECTOR BLE Manager Started")
-
+    
     while True:
         try:
-            # 1. ПОИСК (SCAN)
+            # --- ЭТАП 1: ПОИСК ---
             logger.info("🔍 Сканирую эфир...")
             target = None
             
-            # Сканируем 5 секунд
+            # Сканируем 5 секунд (адаптер hci0)
             devices = await BleakScanner.discover(timeout=5.0, adapter="hci0")
             
-            # Проверяем, есть ли среди найденных наши имена
             for d in devices:
+                # Ищем совпадение по имени
                 if d.name in TARGET_DEVICE_NAMES:
                     target = d
                     logger.info(f"🎯 ЦЕЛЬ ОБНАРУЖЕНА: '{d.name}' [{d.address}]")
                     break
             
             if not target:
-                logger.warning(f"⚠️ Vector не найден (всего вокруг: {len(devices)}). Повтор...")
+                logger.warning(f"⚠️ Vector не найден (устройств вокруг: {len(devices)}). Повтор...")
                 latest_sensors["status"] = "searching..."
                 await asyncio.sleep(2)
                 continue
 
-            # 2. ПОДКЛЮЧЕНИЕ (3 попытки)
+            # --- ЭТАП 2: ПОДКЛЮЧЕНИЕ (RETRY MODE) ---
             connected = False
-            for i in range(3): # Пробуем 3 раза
+            # Пробуем 3 раза подряд, если с первого раза ошибка
+            for i in range(3):
                 try:
-                    logger.info(f"🔗 Попытка {i+1}/3 к {target.address}...")
+                    logger.info(f"🔗 Попытка подключения {i+1}/3 к {target.address}...")
+                    
                     client = BleakClient(target.address, timeout=15.0, adapter="hci0")
                     await client.connect()
                     
@@ -128,50 +141,57 @@ async def ble_manager():
                         ble_client = client
                         connected = True
                         logger.info("✅ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ!")
-                        break
+                        break # Выходим из цикла попыток
                 except Exception as e:
-                    logger.warning(f"⚠️ Сбой: {e}")
-                    await asyncio.sleep(1.5) # Даем ESP32 время отдышаться
+                    logger.warning(f"⚠️ Сбой попытки {i+1}: {e}")
+                    await asyncio.sleep(1.5) # Даем ESP32 отдышаться
             
             if not connected:
-                logger.error("🧨 Не удалось подключиться. Пробую искать заново...")
+                logger.error("🧨 Не удалось подключиться. Перезапуск поиска...")
                 continue
 
-            # 3. РАБОТА
+            # --- ЭТАП 3: РАБОТА ---
             latest_sensors["status"] = "connected"
-            try: 
+            
+            # Подписка на уведомления
+            try:
                 await client.start_notify(SENSOR_UUID, notify_handler)
-                logger.info("📡 Подписка на данные активна")
+                logger.info("📡 Подписка на датчики активирована")
             except Exception as e:
-                logger.error(f"⚠️ Ошибка подписки (но связь есть): {e}")
+                logger.error(f"⚠️ Ошибка подписки (но соединение живое): {e}")
 
-            # Держим соединение пока оно живое
+            # Держим соединение в бесконечном цикле
             while client.is_connected:
                 await asyncio.sleep(1)
-
-            logger.warning("🔌 Устройство отключилось")
+                
+            # Если вышли сюда - значит связь прервалась
+            logger.warning("🔌 Соединение разорвано")
             ble_client = None
             latest_sensors["status"] = "disconnected"
 
         except Exception as e:
-            logger.error(f"🧨 Критическая ошибка: {e}")
-            # Если совсем всё плохо - сбрасываем адаптер
+            logger.error(f"🔥 Критическая ошибка BLE: {e}")
+            ble_client = None
+            latest_sensors["status"] = "error"
+            # Если всё плохо - жесткий сброс адаптера
             os.system("sudo hciconfig hci0 reset")
-            await asyncio.sleep(5)
+            await asyncio.sleep(5) 
 
 # ===========================
-# 🚀 MAIN
+# 🚀 ЗАПУСК
 # ===========================
 def start_ble_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_until_complete(ble_manager())
 
 if __name__ == '__main__':
-    # Сброс Bluetooth при старте (Обязательно!)
+    # 1. СБРОС СЛУЖБЫ (ОБЯЗАТЕЛЬНО)
     reset_bluetooth_service()
+
+    # 2. ЗАПУСК BLE В ФОНЕ
+    ble_thread = threading.Thread(target=start_ble_loop, args=(ble_loop,), daemon=True)
+    ble_thread.start()
     
-    t = threading.Thread(target=start_ble_loop, args=(ble_loop,), daemon=True)
-    t.start()
-    
-    logger.info(f"🚀 SERVER: {API_PORT}")
+    # 3. ЗАПУСК ВЕБ-СЕРВЕРА
+    logger.info(f"🚀 SERVER RUNNING ON PORT {API_PORT}")
     app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False)
