@@ -1,211 +1,186 @@
-import bluetooth, machine, neopixel, json, time, random, os
-from machine import Pin, I2C
-import ahtx0, ens160 
+import asyncio
+import json
+import threading
+import time
+import os
+import logging
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from bleak import BleakClient, BleakScanner
 
-# --- КОНСТАНТЫ ---
-PIN_LED = 4
-PIN_SDA = 21
-PIN_SCL = 22
-DEFAULT_LEDS = 300 # <--- ТЕПЕРЬ 300 ПО УМОЛЧАНИЮ
-CONFIG_FILE = "config.json" 
+# ===========================
+# ⚙️ НАСТРОЙКИ (УНИВЕРСАЛЬНЫЕ)
+# ===========================
 
-# Bluetooth UUIDs
-_SERVICE_UUID = bluetooth.UUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
-_CHAR_SENSOR  = (bluetooth.UUID("beb5483e-36e1-4688-b7f5-ea07361b26a8"), bluetooth.FLAG_READ | bluetooth.FLAG_NOTIFY)
-_CHAR_LED     = (bluetooth.UUID("82258ba0-0557-4303-91ca-00dcc5703003"), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
-_SERVICE      = (_SERVICE_UUID, (_CHAR_SENSOR, _CHAR_LED),)
+# Ищем ЛЮБОЕ из этих имен.
+# "MPY ESP32" - чтобы работало прямо сейчас.
+# "VECTOR_ESP32" - чтобы работало в будущем.
+TARGET_DEVICE_NAMES = ["VECTOR_ESP32", "MPY ESP32"]
 
-# --- КЛАСС ЛЕНТЫ ---
-class VectorLed:
-    def __init__(self, pin, num):
-        self.pin = pin
-        self.num = num
-        self.np = neopixel.NeoPixel(Pin(pin), num)
-        self.mode = "RAINBOW"
-        self.color = (255, 165, 0)
-        self.bright = 0.8
-        self.speed = 50
-        self.step = 0
-        self.last_tick = 0
+# UUID (Те, что сейчас в твоей ESP32)
+SENSOR_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+LED_CHAR_UUID    = "82258ba0-0557-4303-91ca-00dcc5703003"
 
-    def reconfig(self, new_num):
-        if new_num != self.num:
-            self.num = new_num
-            self.np = neopixel.NeoPixel(Pin(self.pin), self.num)
-            print(f"✨ Лента пересобрана: {self.num} LEDs")
+API_PORT = 5005
 
-    def wheel(self, pos):
-        if pos < 85: return (pos * 3, 255 - pos * 3, 0)
-        if pos < 170: pos -= 85; return (255 - pos * 3, 0, pos * 3)
-        pos -= 170; return (0, pos * 3, 255 - pos * 3)
+# ===========================
+# 📦 GLOBAL STATE
+# ===========================
 
-    def apply_bright(self, color):
-        return tuple(int(c * self.bright) for c in color)
+latest_sensors = {"temp": 0, "hum": 0, "co2": 0, "status": "booting..."}
+ble_client = None
+ble_loop = asyncio.new_event_loop()
 
-    def tick(self):
-        now = time.ticks_ms()
-        delay = 105 - self.speed 
-        if time.ticks_diff(now, self.last_tick) < delay: return
-        self.last_tick = now
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger("VECTOR")
 
-        if self.mode == "OFF":
-            self.np.fill((0,0,0))
-        elif self.mode == "STATIC":
-            self.np.fill(self.apply_bright(self.color))
-        elif self.mode == "RAINBOW":
-            for i in range(self.num):
-                idx = (int(i * 256 / self.num) + self.step) & 255
-                self.np[i] = self.apply_bright(self.wheel(idx))
-            self.step = (self.step + 3) & 255
-        elif self.mode == "METEOR":
-            for i in range(self.num):
-                c = self.np[i]
-                self.np[i] = (int(c[0]*0.6), int(c[1]*0.6), int(c[2]*0.6))
-            pos = self.step % self.num
-            self.np[pos] = self.apply_bright(self.color)
-            self.step += 1
-        elif self.mode == "FIRE":
-            for i in range(self.num):
-                flicker = random.randint(0, 50)
-                r = max(0, min(255, self.color[0] - flicker))
-                g = max(0, min(255, self.color[1] - flicker))
-                self.np[i] = self.apply_bright((r, g, 0))
-        elif self.mode == "POLICE":
-            c = (255, 0, 0) if (self.step // 5) % 2 == 0 else (0, 0, 255)
-            self.np.fill(self.apply_bright(c))
-            self.step += 1
-        self.np.write()
+app = Flask(__name__)
+CORS(app)
 
-# --- СИСТЕМА ---
-class VectorSystem:
-    def __init__(self):
-        print("⚡ Инициализация VECTOR...")
-        
-        # 1. Загрузка конфига
-        self.config = self.load_config()
-        
-        # ХАК: Если в памяти записано старое число (30), меняем на 300
-        if self.config.get("leds", 0) < DEFAULT_LEDS:
-             print("🔄 Обновляю старый конфиг до 300 LED...")
-             self.config["leds"] = DEFAULT_LEDS
-             self.led_num = DEFAULT_LEDS
-             self.save_config() # Перезаписываем файл
-        else:
-             self.led_num = self.config.get("leds", DEFAULT_LEDS)
+# ===========================
+# 🛠 СИСТЕМА (СБРОС ЗАВИСАНИЙ)
+# ===========================
 
-        # 2. I2C и Датчики
-        self.i2c = I2C(0, scl=Pin(PIN_SCL), sda=Pin(PIN_SDA), freq=100000)
+def reset_bluetooth_service():
+    """
+    Перезапуск службы Bluetooth перед стартом.
+    Решает проблему, когда RPi не видит устройства после перезапуска скрипта.
+    """
+    logger.info("💀 SYSTEM: Перезапуск службы Bluetooth (BlueZ)...")
+    try:
+        os.system("sudo rfkill unblock bluetooth")
+        os.system("sudo systemctl restart bluetooth")
+        time.sleep(3) # Ждем, пока служба поднимется
+        os.system("sudo hciconfig hci0 up")
         time.sleep(1)
-        devices = self.i2c.scan()
-        
-        self.aht = None
-        if 0x38 in devices:
-            try: self.aht = ahtx0.AHT10(self.i2c)
-            except: pass
-        
-        self.ens = None
-        if 0x53 in devices:
-            try: self.ens = ens160.ENS160(self.i2c)
-            except: pass
+        logger.info("✅ SYSTEM: Bluetooth готов.")
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка сброса (запусти с sudo): {e}")
 
-        # 3. Лента
-        self.led = VectorLed(PIN_LED, self.led_num)
-        # Восстанавливаем настройки
-        self.led.mode = self.config.get("mode", "RAINBOW")
-        self.led.speed = self.config.get("speed", 50)
-        self.led.bright = self.config.get("bright", 0.8)
-        if "color" in self.config:
-            self.led.color = tuple(self.config["color"])
+# ===========================
+# 🌐 API
+# ===========================
 
-        # 4. Bluetooth
-        self.ble = bluetooth.BLE()
-        self.ble.active(True)
-        self.ble.irq(self.ble_irq)
-        ((self.h_sens, self.h_led),) = self.ble.gatts_register_services((_SERVICE,))
-        self.advertise()
-        print(f"📡 BLE STARTED (LEDs: {self.led.num})")
+@app.route('/api/sensors', methods=['GET'])
+def get_sensors():
+    return jsonify(latest_sensors)
 
-    def load_config(self):
+@app.route('/api/led', methods=['POST'])
+def control_led():
+    global ble_client
+    command = request.json
+    logger.info(f"🌍 API CMD: {command}")
+    
+    if ble_client and ble_client.is_connected:
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {"leds": DEFAULT_LEDS, "mode": "RAINBOW"}
-
-    def save_config(self):
-        data = {
-            "leds": self.led.num if hasattr(self, 'led') else DEFAULT_LEDS,
-            "mode": self.led.mode if hasattr(self, 'led') else "RAINBOW",
-            "speed": self.led.speed if hasattr(self, 'led') else 50,
-            "bright": self.led.bright if hasattr(self, 'led') else 0.8,
-            "color": self.led.color if hasattr(self, 'led') else (255,165,0)
-        }
-        # Если вызываем save до создания self.led (как в hack выше), используем self.config
-        if not hasattr(self, 'led'):
-             data.update(self.config)
-
-        try:
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(data, f)
+            payload = json.dumps(command).encode('utf-8')
+            asyncio.run_coroutine_threadsafe(
+                ble_client.write_gatt_char(LED_CHAR_UUID, payload), ble_loop
+            )
+            return jsonify({"status": "success"})
         except Exception as e:
-            print("Save Err:", e)
+            logger.error(f"❌ Send Error: {e}")
+            return jsonify({"status": "error", "msg": str(e)}), 500
+    else:
+        return jsonify({"status": "offline"}), 503
 
-    def ble_irq(self, event, data):
-        if event == 1: print("🔗 Connected")
-        elif event == 2: self.advertise()
-        elif event == 3: 
-            conn, handle = data
-            if handle == self.h_led:
-                self.handle_command(self.ble.gatts_read(handle))
+@app.route('/system/reboot', methods=['POST'])
+def system_reboot():
+    os.system('sudo reboot')
+    return jsonify({"status": "rebooting"})
 
-    def advertise(self):
-        name = "VECTOR_ESP32"
-        adv = bytearray('\x02\x01\x06', 'utf-8') + bytearray([len(name)+1, 0x09]) + name.encode()
-        self.ble.gap_advertise(100, adv)
+@app.route('/system/shutdown', methods=['POST'])
+def system_shutdown():
+    os.system('sudo shutdown -h now')
+    return jsonify({"status": "shutting_down"})
 
-    def handle_command(self, data):
+# ===========================
+# 🦷 BLE MANAGER (ПОИСК ПО СПИСКУ ИМЕН)
+# ===========================
+
+def sensor_notification_handler(sender, data):
+    global latest_sensors
+    try:
+        decoded = data.decode('utf-8')
+        latest_sensors.update(json.loads(decoded))
+        latest_sensors["status"] = "online"
+    except:
+        pass
+
+async def ble_manager():
+    global ble_client
+    logger.info("🦷 Служба VECTOR BLE запущена")
+    
+    while True:
         try:
-            cmd = json.loads(data.decode())
-            print("📩 CMD:", cmd)
-            save = False
-
-            if "config" in cmd:
-                new_num = cmd["config"].get("num", self.led.num)
-                if new_num != self.led.num:
-                    self.led.reconfig(new_num)
-                    save = True
+            # 1. ПОИСК (SCAN)
+            logger.info("🔍 Ищу устройства (VECTOR_ESP32 или MPY ESP32)...")
             
-            if "mode" in cmd: self.led.mode = cmd["mode"]; save=True
-            if "color" in cmd: self.led.color = tuple(cmd["color"]); save=True
-            if "speed" in cmd: self.led.speed = cmd["speed"]; save=True
-            if "bright" in cmd: self.led.bright = cmd["bright"]; save=True
+            # Сканируем эфир 5 секунд
+            devices = await BleakScanner.discover(timeout=5.0, adapter="hci0")
+            
+            # Ищем совпадение по имени
+            target_device = None
+            for d in devices:
+                # Если имя устройства есть в нашем списке TARGET_DEVICE_NAMES
+                if d.name in TARGET_DEVICE_NAMES:
+                    target_device = d
+                    logger.info(f"🎯 НАЙДЕНО: '{d.name}' [{d.address}]")
+                    break
+            
+            if not target_device:
+                logger.warning(f"⚠️ Цель не найдена. (Вижу {len(devices)} других). Повтор...")
+                latest_sensors["status"] = "searching..."
+                await asyncio.sleep(3)
+                continue
+
+            # 2. ПОДКЛЮЧЕНИЕ (CONNECT)
+            logger.info(f"🔗 Подключаюсь к {target_device.address}...")
+            
+            async with BleakClient(target_device.address, timeout=15.0, adapter="hci0") as client:
+                ble_client = client
                 
-            if save: self.save_config()
-        except: pass
+                if client.is_connected:
+                    logger.info(f"✅ УСПЕШНО ПОДКЛЮЧЕНО к {target_device.name}!")
+                    latest_sensors["status"] = "connected"
+                    
+                    # Подписка на уведомления
+                    try:
+                        await client.start_notify(SENSOR_CHAR_UUID, sensor_notification_handler)
+                    except Exception as e:
+                        logger.error(f"⚠️ Ошибка подписки (проверь UUID): {e}")
 
-    def loop(self):
-        last_sensor_time = 0
-        while True:
-            self.led.tick()
-            now = time.ticks_ms()
-            if time.ticks_diff(now, last_sensor_time) > 3000:
-                last_sensor_time = now
-                self.read_sensors()
-            time.sleep_ms(10)
+                    # Держим соединение
+                    while client.is_connected:
+                        await asyncio.sleep(1)
+                        
+                logger.warning("🔌 Устройство отключилось")
+                ble_client = None
+                latest_sensors["status"] = "disconnected"
 
-    def read_sensors(self):
-        t, h, co2 = 0, 0, 0
-        if self.aht: 
-            try: t, h = self.aht.read()
-            except: pass
-        if self.ens: 
-            try: _, _, co2 = self.ens.read_all()
-            except: pass
-        if co2 == 0: co2 = 400
-        payload = json.dumps({"temp": round(t, 1), "hum": int(h), "co2": int(co2)})
-        try: self.ble.gatts_notify(0, self.h_sens, payload)
-        except: pass 
+        except Exception as e:
+            logger.error(f"🧨 Ошибка BLE: {e}")
+            ble_client = None
+            latest_sensors["status"] = "error"
+            # Если ошибка - немного ждем перед новой попыткой
+            await asyncio.sleep(5) 
 
-# ЗАПУСК
-sys = VectorSystem()
-sys.loop()
+# ===========================
+# 🚀 ЗАПУСК
+# ===========================
+
+def start_ble_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(ble_manager())
+
+if __name__ == '__main__':
+    # 1. Обязательный сброс службы (Fix зависания RPi)
+    reset_bluetooth_service()
+
+    # 2. Поток BLE
+    ble_thread = threading.Thread(target=start_ble_loop, args=(ble_loop,), daemon=True)
+    ble_thread.start()
+    
+    # 3. Flask
+    logger.info(f"🚀 VECTOR SERVER running on {API_PORT}")
+    app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False)
