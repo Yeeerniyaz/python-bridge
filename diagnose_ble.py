@@ -2,96 +2,93 @@ import asyncio
 import sys
 from bleak import BleakScanner, BleakClient
 
-# Сенің ESP32-дегі UUID-ларың
+# Сенің ESP32 параметрлерің
 TARGET_NAME = "Vector_Party"
-UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-WRITE_UUID        = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-NOTIFY_UUID       = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+TARGET_ADDRESS = "14:33:5C:C0:5C:BA" # Сенің соңғы логыңнан алынды
+WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
-async def scan_only():
-    print(f"\n🔎 [1-ВАРИАНТ] Барлық құрылғыларды қарап шығу...")
+async def try_variant(variant_name, address, timeout, sleep_after_connect):
+    print(f"\n👉 [{variant_name}] әдісін байқап көрудеміз...")
+    print(f"   (Timeout: {timeout}s, Sleep: {sleep_after_connect}s)")
+    
+    client = BleakClient(address, timeout=timeout)
     try:
-        devices = await BleakScanner.discover(timeout=5.0)
-        found = False
-        for d in devices:
-            name = d.name or "Unknown"
-            # RSSI кейде қате береді, сондықтан жай ғана адресті шығарамыз
-            print(f"   - {name} [{d.address}]")
-            if TARGET_NAME in name:
-                found = True
-                print(f"   ✅ ТАБЫЛДЫ! Бұл біздің клиент!")
+        await client.connect()
+        print(f"   ✅ ҚОСЫЛДЫ! ({variant_name})")
         
-        if not found:
-            print("   ❌ 'Vector_Party' эфирде көрінбейді.") 
-        return found
-    except Exception as e:
-        print(f"   ⚠️ Сканерлеу қатесі: {e}")
-        return False
-
-async def connect_and_list_services(address):
-    print(f"\n🔗 [2-ВАРИАНТ] Қосылу және UUID тексеру...")
-    try:
-        async with BleakClient(address, timeout=15.0) as client:
-            print(f"   ✅ Қосылдық! ({address})")
+        # Кейбір ESP32 сервистерді жүктеуге уақыт сұрайды
+        if sleep_after_connect > 0:
+            print(f"   ⏳ Тұрақталуын күту ({sleep_after_connect} сек)...")
+            await asyncio.sleep(sleep_after_connect)
             
-            print("   📜 Сервистер тізімі:")
-            for service in client.services:
-                print(f"   - Service: {service.uuid}")
-                for char in service.characteristics:
-                    print(f"     -- Char: {char.uuid} ({', '.join(char.properties)})")
-                    
-                    if str(char.uuid).upper() == WRITE_UUID.upper():
-                        print("        ✨ WRITE UUID сәйкес келеді!")
-                    if str(char.uuid).upper() == NOTIFY_UUID.upper():
-                        print("        ✨ NOTIFY UUID сәйкес келеді!")
-                        
-            return True
-    except Exception as e:
-        print(f"   ❌ Қосылу қатесі: {e}")
-        return False
+        # Сервистерді тексеру (ең қиын жері осы)
+        print("   📜 Сервистерді оқуда...")
+        # Bleak мұны автоматты түрде жасайды, біз жай ғана тексереміз
+        services = client.services
+        if not services:
+             print("   ❌ Сервистер бос! (Discovery Failed)")
+             await client.disconnect()
+             return False
+             
+        print(f"   ✅ Сервистер табылды: {len(services)} дана")
+        
+        # Жұмыс істеп тұрғанын тексеру үшін команда жібереміз
+        cmd = b'{"color": [255, 0, 0]}' # Қызыл
+        await client.write_gatt_char(WRITE_UUID, cmd, response=True)
+        print("   ✅ Команда сәтті жіберілді! Байланыс тұрақты.")
+        
+        await client.disconnect()
+        return True
 
-async def try_send_command(address):
-    print(f"\n📨 [3-ВАРИАНТ] Команда жіберіп көру...")
-    try:
-        async with BleakClient(address, timeout=10.0) as client:
-            # Түсті өзгерту командасы (JSON)
-            cmd = b'{"color": [0, 255, 0]}' # Жасыл түс
-            print(f"   📤 Жіберіп жатырмын: {cmd}")
-            
-            await client.write_gatt_char(WRITE_UUID, cmd, response=True)
-            print("   ✅ Команда кетті! Светодиод жанды ма?")
-            return True
     except Exception as e:
-        print(f"   ❌ Жіберу қатесі: {e}")
+        print(f"   ❌ Сәтсіз аяқталды: {e}")
+        # Егер қосылып тұрса, үземіз
+        try:
+            await client.disconnect()
+        except:
+            pass
         return False
 
 async def main():
-    print("💎 VECTOR DIAGNOSTICS TOOL v2 💎")
+    print(f"💎 VECTOR BRUTE FORCE CONNECT 💎")
+    print(f"🎯 Мақсат: {TARGET_NAME} [{TARGET_ADDRESS}]")
+
+    # === ВАРИАНТТАР ТІЗІМІ ===
     
-    # 1. SCAN
-    print("📡 'Vector_Party' ізделуде...")
-    device = await BleakScanner.find_device_by_filter(
-        lambda d, ad: d.name and TARGET_NAME in d.name
-    )
-    
-    if not device:
-        print("\n❌ ҚАТЕ: ESP32 тікелей іздеуде табылған жоқ.")
-        print("Кеңес: ESP32-ні розеткадан суырып, қайта қос.")
-        await scan_only() # Барлық құрылғыларды көрсету
+    # 1-Вариант: Стандартты (Ең жылдам)
+    if await try_variant("1. STANDARD", TARGET_ADDRESS, timeout=10.0, sleep_after_connect=0):
+        print("\n🎉 1-ші вариант жұмыс істеді!")
         return
 
-    print(f"\n✅ ESP32 табылды: {device.address}")
-    
-    # 2. SERVICE CHECK
-    connected = await connect_and_list_services(device.address)
-    if not connected:
+    # 2-Вариант: "Сабырлы" (ESP32-ге ес жиюға уақыт береміз)
+    # Сенің ESP32 кодыңда 3 секунд пауза бар, соны ескереміз
+    print("\n⚠️ 1-ші вариант өтпеді. 2 секунд демалыс...")
+    await asyncio.sleep(2)
+    if await try_variant("2. PATIENT (Wait 4s)", TARGET_ADDRESS, timeout=15.0, sleep_after_connect=4.0):
+        print("\n🎉 2-ші вариант жұмыс істеді! (Кідіріс керек екен)")
         return
 
-    # 3. SEND CHECK
-    await try_send_command(device.address)
+    # 3-Вариант: "Ұзақ күту" (Timeout 25 секунд)
+    print("\n⚠️ 2-ші вариант өтпеді. 2 секунд демалыс...")
+    await asyncio.sleep(2)
+    if await try_variant("3. LONG TIMEOUT", TARGET_ADDRESS, timeout=25.0, sleep_after_connect=1.0):
+        print("\n🎉 3-ші вариант жұмыс істеді!")
+        return
+
+    # 4-Вариант: "Тез-тез" (Cache жаңарту үшін)
+    print("\n⚠️ 3-ші вариант өтпеді. Cache мәселесі болуы мүмкін.")
+    print("🔄 Тез қосылып-өшіп көреміз...")
+    await try_variant("4. DUMMY CONNECT", TARGET_ADDRESS, timeout=5.0, sleep_after_connect=0)
+    await asyncio.sleep(1)
+    if await try_variant("4. REAL CONNECT", TARGET_ADDRESS, timeout=10.0, sleep_after_connect=1.0):
+        print("\n🎉 4-ші вариант жұмыс істеді!")
+        return
+
+    print("\n❌ БАРЛЫҚ ВАРИАНТТАР СӘТСІЗ АЯҚТАЛДЫ.")
+    print("Кеңес: `sudo bluetoothctl remove 14:33:5C:C0:5C:BA` жасап көр.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nТоқтатылды.")
+        pass
