@@ -1,131 +1,183 @@
 import asyncio
 import json
+import logging
 from quart import Quart, request, jsonify
-from bleak import BleakClient, BleakScanner
-
-app = Quart(__name__)
+from bleak import BleakScanner, BleakClient
 
 # ===========================
-# ⚙️ НАСТРОЙКИ (Из твоего main.py)
+# ⚙️ НАСТРОЙКИ (CONFIG)
 # ===========================
 TARGET_NAME = "Vector_Party"
+# UUID-лар сенің ESP32-мен бірдей болуы керек!
+WRITE_UUID  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
-# В твоем MicroPython коде:
-# RX_UUID = ...E50E24DCCA9E (FLAG_WRITE) - сюда мы пишем с Raspberry Pi
-WRITE_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+# API Server
+app = Quart(__name__)
 
-# Глобальные переменные для соединения
-client = None
-device_address = None
+# Логтарды әдемілеу
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("VECTOR")
 
-async def get_client():
-    """Менеджер соединения BLE. Ищет, подключается и держит связь."""
-    global client, device_address
-    
-    # 1. Если уже подключены — возвращаем клиент
-    if client and client.is_connected:
-        return client
+# ===========================
+# 🧠 BLE МЕНЕДЖЕР (Бронепоезд)
+# ===========================
+class VectorBLEManager:
+    def __init__(self):
+        self.client = None
+        self.queue = asyncio.Queue()  # Командалар кезегі
+        self.connected = False
+        self.running = True
+        self.device_address = None
 
-    print(f"📡 Сканирую эфир в поиске {TARGET_NAME}...")
-    
-    # 2. Поиск устройства
-    device = await BleakScanner.find_device_by_filter(
-        lambda d, ad: d.name and TARGET_NAME in d.name
-    )
+    async def start_loop(self):
+        """Негізгі фондық процесс: Қосылу -> Күту -> Командаларды орындау"""
+        logger.info("🚀 BLE Manager is starting...")
+        
+        while self.running:
+            try:
+                # 1. Егер байланыс жоқ болса -> ҚОСЫЛАМЫЗ
+                if not self.connected or not self.client or not self.client.is_connected:
+                    await self.connect_logic()
+                
+                # 2. Егер байланыс бар болса -> КЕЗЕКТІ ТЕКСЕРЕМІЗ
+                if self.connected:
+                    try:
+                        # Кезекте команда бар ма? (0.5 сек күтеміз)
+                        cmd_data = await asyncio.wait_for(self.queue.get(), timeout=0.5)
+                        await self.send_raw(cmd_data)
+                        self.queue.task_done()
+                    except asyncio.TimeoutError:
+                        # Кезек бос, жай ғана байланысты тексеріп тұрамыз
+                        pass
+                    except Exception as e:
+                        logger.error(f"Queue Error: {e}")
+                        self.connected = False # Қате шықса, қайта қосылуға жібереміз
 
-    if not device:
-        print("❌ Устройство не найдено! (Проверь питание ESP32)")
-        return None
+            except Exception as main_err:
+                logger.error(f"💥 Main Loop Crash Protected: {main_err}")
+                await asyncio.sleep(2) # Спам жасамау үшін кідіріс
 
-    device_address = device.address
-    print(f"✅ Нашел! Адрес: {device_address}. Подключаюсь...")
-    
-    # 3. Подключение
-    client = BleakClient(device_address)
-    try:
-        await client.connect()
-        print(f"🔗 Успешное подключение к {TARGET_NAME}!")
-        return client
-    except Exception as e:
-        print(f"❌ Ошибка подключения: {e}")
-        client = None
-        return None
+    async def connect_logic(self):
+        """Қосылу логикасы (Retry, Scan, Wait)"""
+        self.connected = False
+        logger.info("📡 Scanning for Vector_Party...")
 
-async def send_to_esp(message: str):
-    """Отправляет строку на ESP32 (конвертирует в байты)."""
-    ble = await get_client()
-    if ble:
         try:
-            # Твой MicroPython делает .decode(), поэтому мы кодируем в utf-8
-            data = message.encode("utf-8")
-            await ble.write_gatt_char(WRITE_CHAR_UUID, data)
-            print(f"📤 Отправлено: {message}")
-            return True
+            # А) Іздеу
+            device = await BleakScanner.find_device_by_filter(
+                lambda d, ad: d.name and TARGET_NAME in d.name,
+                timeout=10.0
+            )
+
+            if not device:
+                logger.warning("❌ Device not found. Retrying in 3s...")
+                await asyncio.sleep(3)
+                return
+
+            self.device_address = device.address
+            logger.info(f"✅ Found: {self.device_address}. Connecting...")
+
+            # Б) Қосылу
+            self.client = BleakClient(device, timeout=15.0)
+            await self.client.connect()
+            
+            logger.info("🔗 Bluetooth Connected!")
+            
+            # В) ⏳ ПАУЗА (ESP32 есін жиюы үшін - ӨТЕ МАҢЫЗДЫ!)
+            logger.info("⏳ Waiting 4s for ESP32 stabilization...")
+            await asyncio.sleep(4)
+
+            # Г) Сервистерді тексеру (GATT)
+            services = self.client.services
+            if not services:
+                logger.warning("⚠️ Services empty! Forcing refresh...")
+                services = await self.client.get_services()
+            
+            logger.info(f"✅ Services ready: {len(services)} found.")
+            self.connected = True
+            
+            # Д) Тест командасын жіберу (Мысалы, жасыл "жыпылық" - мен тірімін деген белгі)
+            # await self.send_raw(b'{"color":[0,10,0]}') 
+
         except Exception as e:
-            print(f"⚠️ Ошибка отправки: {e}")
-            global client
-            client = None # Сбрасываем клиент, чтобы переподключиться
-            return False
-    return False
+            logger.error(f"❌ Connection Failed: {e}")
+            self.connected = False
+            # Қате болса, клиентті тазалаймыз
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except: pass
+                self.client = None
+            await asyncio.sleep(3)
+
+    async def send_raw(self, data: bytes):
+        """Тікелей жіберу (қателерді ұстап қалады)"""
+        if not self.client or not self.connected:
+            logger.warning("⚠️ Cannot send: Disconnected")
+            raise ConnectionError("No BLE Connection")
+        
+        try:
+            logger.info(f"📤 Sending: {data}")
+            await self.client.write_gatt_char(WRITE_UUID, data, response=True)
+        except Exception as e:
+            logger.error(f"❌ Send Error: {e}")
+            self.connected = False # Келесі циклде реконнект болады
+            raise e
+
+    async def enqueue_command(self, command_str: str):
+        """API-дан келген команданы кезекке қосу"""
+        logger.info(f"📥 Enqueued: {command_str}")
+        await self.queue.put(command_str.encode('utf-8'))
+
+# Менеджерді жасаймыз (Глобалды объект)
+ble_manager = VectorBLEManager()
 
 # ===========================
-# 🌐 API ЭНДПОИНТЫ (Для Electron)
+# 🌐 API ROUTES (API)
 # ===========================
+
+@app.before_serving
+async def startup():
+    """Сервер қосылғанда BLE циклін бастаймыз"""
+    asyncio.create_task(ble_manager.start_loop())
 
 @app.route('/led/color', methods=['POST'])
 async def set_color():
-    """Принимает JSON: {'color': [255, 0, 0]}"""
-    try:
-        req_data = await request.get_json()
-        rgb = req_data.get('color') # [R, G, B]
-        
-        if not rgb or len(rgb) != 3:
-            return jsonify({"status": "error", "msg": "Invalid color format"}), 400
-
-        # Твой main.py ждет JSON строку для цвета: {"color": [r,g,b]}
-        # Строка 44 в main.py: if msg.startswith("{"): ... data = json.loads(msg)
-        cmd_json = json.dumps({"color": rgb})
-        
-        success = await send_to_esp(cmd_json)
-        if success:
-            return jsonify({"status": "ok", "color": rgb})
-        else:
-            return jsonify({"status": "error", "msg": "BLE Disconnected"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
+    data = await request.get_json()
+    rgb = data.get('color')
+    if rgb:
+        # JSON дайындау
+        cmd = json.dumps({"color": rgb})
+        # Кезекке лақтыру (жауапты күтпейміз, клиентке тез жауап береміз)
+        await ble_manager.enqueue_command(cmd)
+        return jsonify({"status": "queued", "color": rgb})
+    return jsonify({"error": "no color"}), 400
 
 @app.route('/led/mode', methods=['POST'])
 async def set_mode():
-    """Принимает JSON: {'mode': 'RAINBOW'}"""
-    try:
-        req_data = await request.get_json()
-        mode = req_data.get('mode') # RAINBOW, FIRE, POLICE, OFF
-        
-        if not mode:
-            return jsonify({"status": "error", "msg": "No mode provided"}), 400
-
-        # Твой main.py ждет просто строку для режимов
-        # Строка 57 в main.py: current_mode = cmd
-        success = await send_to_esp(mode.upper())
-        
-        if success:
-            return jsonify({"status": "ok", "mode": mode})
-        else:
-            return jsonify({"status": "error", "msg": "BLE Disconnected"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
+    data = await request.get_json()
+    mode = data.get('mode')
+    if mode:
+        await ble_manager.enqueue_command(mode.upper())
+        return jsonify({"status": "queued", "mode": mode})
+    return jsonify({"error": "no mode"}), 400
 
 @app.route('/led/off', methods=['POST'])
-async def led_off():
-    """Просто выключает свет"""
-    success = await send_to_esp("OFF")
-    return jsonify({"status": "off" if success else "error"})
+async def set_off():
+    await ble_manager.enqueue_command("OFF")
+    return jsonify({"status": "queued", "action": "off"})
+
+@app.route('/status', methods=['GET'])
+async def get_status():
+    return jsonify({
+        "connected": ble_manager.connected,
+        "queue_size": ble_manager.queue.qsize(),
+        "device": ble_manager.device_address
+    })
 
 # ===========================
-# 🚀 ЗАПУСК
+# 🚀 MAIN START
 # ===========================
 if __name__ == '__main__':
-    print("💎 VECTOR Python Bridge запускается на порту 5005...")
-    # Запускаем Quart сервер
+    # Hypercorn/Uvicorn-сыз тікелей іске қосу (Dev mode)
     app.run(host='0.0.0.0', port=5005)
-    
