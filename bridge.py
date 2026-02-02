@@ -41,6 +41,7 @@ class VectorBLEManager:
                 # 2. Кезектегі командаларды орындау
                 if self.connected:
                     try:
+                        # Кезектегі деректерді күтеміз (Byte форматында)
                         cmd_data = await asyncio.wait_for(self.queue.get(), timeout=0.5)
                         await self.send_raw(cmd_data)
                         self.queue.task_done()
@@ -79,23 +80,19 @@ class VectorBLEManager:
             
             logger.info("🔗 Bluetooth Connected!")
             
-            # В) ⏳ ПАУЗА (ESP32 тұрақталуы үшін)
+            # В) ⏳ ПАУЗА (ESP32 тұрақталуы үшін - МАҢЫЗДЫ!)
             logger.info("⏳ Waiting 4s for ESP32 stabilization...")
             await asyncio.sleep(4)
 
-            # Г) Сервистерді тексеру
-            # ТҮЗЕТУ: len() қатесін болдырмау үшін try-except қолданамыз
+            # Г) Сервистерді тексеру (Қауіпсіз әдіс)
             try:
                 services = self.client.services
-                # Кейбір нұсқаларда get_services() шақыру керек
                 if not services:
                      logger.warning("⚠️ Services empty! Forcing refresh...")
                      services = await self.client.get_services()
                 
-                # Қауіпсіз санау
                 count = 0
-                try:
-                    count = len(list(services))
+                try: count = len(list(services))
                 except: pass
                 logger.info(f"✅ Services ready: {count} found.")
                 
@@ -108,13 +105,13 @@ class VectorBLEManager:
             logger.error(f"❌ Connection Failed: {e}")
             self.connected = False
             if self.client:
-                try:
-                    await self.client.disconnect()
+                try: await self.client.disconnect()
                 except: pass
                 self.client = None
             await asyncio.sleep(3)
 
     async def send_raw(self, data: bytes):
+        """Байттарды тікелей жіберу"""
         if not self.client or not self.connected:
             logger.warning("⚠️ Cannot send: Disconnected")
             raise ConnectionError("No BLE Connection")
@@ -127,9 +124,18 @@ class VectorBLEManager:
             self.connected = False
             raise e
 
-    async def enqueue_command(self, command_str: str):
-        logger.info(f"📥 Enqueued: {command_str}")
-        await self.queue.put(command_str.encode('utf-8'))
+    # --- ЖАҢА SMART PROTOCOL ӘДІСТЕРІ ---
+    async def set_color(self, r, g, b):
+        # !C + R + G + B (Барлығы 5 байт)
+        packet = b'!C' + bytes([int(r), int(g), int(b)])
+        logger.info(f"📥 Enqueued Color: {packet}")
+        await self.queue.put(packet)
+
+    async def set_mode(self, mode):
+        # !M + ModeName
+        packet = f"!M{mode}".encode('utf-8')
+        logger.info(f"📥 Enqueued Mode: {packet}")
+        await self.queue.put(packet)
 
 ble_manager = VectorBLEManager()
 
@@ -141,15 +147,11 @@ ble_manager = VectorBLEManager()
 async def startup():
     asyncio.create_task(ble_manager.start_loop())
 
-# ✅ ТҮЗЕТУ: Датчиктер жоқ, бірақ Electron сұрап жатыр (404 қатесін жою үшін)
+# ✅ Датчиктер қатесін болдырмау үшін
 @app.route('/api/sensors', methods=['GET'])
 async def get_sensors_dummy():
     return jsonify({
-        "temp": 0, 
-        "hum": 0, 
-        "co2": 0, 
-        "pressure": 0,
-        "status": "dummy"
+        "temp": 0, "hum": 0, "co2": 0, "pressure": 0, "status": "dummy"
     })
 
 @app.route('/led/color', methods=['POST'])
@@ -157,8 +159,8 @@ async def set_color():
     data = await request.get_json()
     rgb = data.get('color')
     if rgb:
-        cmd = json.dumps({"color": rgb})
-        await ble_manager.enqueue_command(cmd)
+        # JSON орнына жаңа протоколды қолданамыз
+        await ble_manager.set_color(rgb[0], rgb[1], rgb[2])
         return jsonify({"status": "queued", "color": rgb})
     return jsonify({"error": "no color"}), 400
 
@@ -167,13 +169,13 @@ async def set_mode():
     data = await request.get_json()
     mode = data.get('mode')
     if mode:
-        await ble_manager.enqueue_command(mode.upper())
+        await ble_manager.set_mode(mode)
         return jsonify({"status": "queued", "mode": mode})
     return jsonify({"error": "no mode"}), 400
 
 @app.route('/led/off', methods=['POST'])
 async def set_off():
-    await ble_manager.enqueue_command("OFF")
+    await ble_manager.set_mode("OFF")
     return jsonify({"status": "queued", "action": "off"})
 
 @app.route('/status', methods=['GET'])
