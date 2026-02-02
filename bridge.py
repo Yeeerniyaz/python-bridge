@@ -3,6 +3,7 @@ import threading
 import queue
 import sys
 import json
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from bleak import BleakScanner, BleakClient
@@ -11,6 +12,7 @@ from bleak import BleakScanner, BleakClient
 # ⚙️ НАСТРОЙКИ
 # ===========================
 TARGET_NAME = "Vector_Party"
+# UUIDs (ESP32-мен сәйкес болуы шарт)
 WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 API_PORT = 5000 
@@ -63,6 +65,7 @@ async def run_ble_client():
         system_status["status"] = "scanning"
         
         try:
+            # 1. Іздеу
             devices = await BleakScanner.discover(timeout=5.0)
             for d in devices:
                 if d.name and TARGET_NAME in d.name:
@@ -71,18 +74,18 @@ async def run_ble_client():
                     break
             
             if not target_device:
-                print("⏳ Құрылғы табылмады, қайта іздеймін...", file=sys.stderr)
+                print("⏳ Күтуде... (ESP32 қосулы ма?)", file=sys.stderr)
                 await asyncio.sleep(2)
                 continue
 
+            # 2. Қосылу
             print(f"🔗 Қосылып жатырмын...", file=sys.stderr)
-            
-            # Timeout-ты көбейтеміз (20 секунд)
+            # Timeout-ты 20 секундқа қойдым, үлгерсін деп
             async with BleakClient(target_device.address, timeout=20.0) as client:
-                print(f"✅ [BLE] БАЙЛАНЫС ОРНАДЫ! (Services resolving...)", file=sys.stderr)
+                print(f"✅ [BLE] БАЙЛАНЫС ОРНАДЫ!", file=sys.stderr)
                 
-                # МАҢЫЗДЫ: Қосылған соң сәл күтеміз, ESP өзіне келсін
-                await asyncio.sleep(1.0)
+                # ESP32-ге "дем алуға" уақыт береміз
+                await asyncio.sleep(0.5)
                 
                 system_status["status"] = "connected"
                 system_status["device"] = target_device.address
@@ -90,36 +93,38 @@ async def run_ble_client():
                 try:
                     await client.start_notify(NOTIFY_UUID, notification_handler)
                 except Exception as e:
-                    print(f"⚠️ Notify қосылмады: {e}")
+                    print(f"⚠️ Notify қатесі (маңызды емес): {e}")
 
+                # 3. Жұмыс циклі
                 while client.is_connected:
                     if not cmd_queue.empty():
                         cmd = cmd_queue.get()
                         print(f"⚡ [SEND] -> {cmd}")
                         await client.write_gatt_char(WRITE_UUID, cmd.encode('utf-8'))
                     
-                    await asyncio.sleep(0.1) # PC процессорын босатамыз
+                    await asyncio.sleep(0.05) 
                 
                 print("❌ [BLE] Үзіліп қалды.", file=sys.stderr)
                 system_status["status"] = "disconnected"
 
         except Exception as e:
             print(f"⚠️ [ERROR] Қате: {e}", file=sys.stderr)
-            # Егер қате шықса, Bluetooth адаптерін "есін жиғызу" үшін сәл күтеміз
+            # Қате шықса, 3 секунд демалып барып қайта іздейміз
             await asyncio.sleep(3)
 
 # ===========================
-# 🚀 START
+# 🚀 НЕГІЗГІ СТАРТ
 # ===========================
+
 def start_flask():
     app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     t = threading.Thread(target=start_flask, daemon=True)
     t.start()
-    print(f"🌍 [API] Server: http://localhost:{API_PORT}")
+    print(f"🌍 [API] Сервер дайын: http://localhost:{API_PORT}")
 
     try:
         asyncio.run(run_ble_client())
     except KeyboardInterrupt:
-        print("\n👋 Bye!")
+        print("\n👋 Сау бол!")
