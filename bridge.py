@@ -1,8 +1,12 @@
 import asyncio
 import json
 import logging
+import subprocess 
+
 from quart import Quart, request, jsonify
 from bleak import BleakScanner, BleakClient
+# ... (басқа роуттардың жанына)
+
 
 # ===========================
 # ⚙️ НАСТРОЙКИ (CONFIG)
@@ -184,6 +188,34 @@ async def get_status():
         "connected": ble_manager.connected,
         "device": ble_manager.device_address
     })
+    
+
+@app.route('/screen', methods=['POST'])
+async def set_screen():
+    data = await request.get_json()
+    # React-тан { "on": true } немесе { "on": false } келеді
+    state = data.get('on', True)
+    
+    logger.info(f"🖥 Screen Command: {'ON' if state else 'OFF'}")
+
+    # Raspberry Pi HDMI басқару командасы
+    # vcgencmd display_power 1 (ON) / 0 (OFF)
+    cmd = "vcgencmd display_power 1" if state else "vcgencmd display_power 0"
+    
+    try:
+        # Команданы терминалда орындаймыз
+        subprocess.run(cmd, shell=True)
+        return jsonify({"status": "success", "screen": "ON" if state else "OFF"})
+    except Exception as e:
+        logger.error(f"❌ Screen Error: {e}")
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/led/on', methods=['POST'])
+async def set_on():
+    # Қосқанда әдепкі режим (мысалы, STATIC немесе соңғысы)
+    # Өзің қалаған режимді жаз: "STATIC", "BREATHING", "SCANNER"
+    await ble_manager.set_mode("STATIC") 
+    return jsonify({"status": "queued", "action": "on"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5005)
