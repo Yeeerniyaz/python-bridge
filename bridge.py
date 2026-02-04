@@ -191,7 +191,6 @@ async def get_status():
         "device": ble_manager.device_address
     })
     
-
 @app.route('/screen', methods=['POST'])
 async def set_screen():
     data = await request.get_json()
@@ -199,41 +198,37 @@ async def set_screen():
     
     logger.info(f"🖥 Screen Command Received: {'ON' if state else 'OFF'}")
 
-    # Қоршаған орта айнымалыларын баптау
+    # DISPLAY айнымалыларын root үшін де, пайдаланушы үшін де жібереміз
     env = os.environ.copy()
     env["DISPLAY"] = ":0"
-    # Xauthority жолын автоматты түрде анықтауға тырысамыз немесе стандартты жолды қоямыз
-    env["XAUTHORITY"] = f"/home/yerniyaz/.Xauthority" 
+    env["XAUTHORITY"] = "/home/yerniyaz/.Xauthority"
 
-    # Командалар тізімі
     if state:
-        # ҚОСУ үшін бірнеше әдіс
-        commands = [
-            "vcgencmd display_power 1",
-            "xset -display :0 dpms force on",
-            "xset -display :0 s reset"
-        ]
+        # ҚОСУ: Командалар тізбегі
+        # 1. HDMI қуаты 2. DPMS ояту 3. Экранды "қараңғылықтан" шығару
+        cmd = "vcgencmd display_power 1; xset -display :0 dpms force on; xset -display :0 s reset; xset -display :0 s off"
     else:
-        # ӨШІРУ үшін бірнеше әдіс
-        commands = [
-            "xset -display :0 dpms force off",
-            "vcgencmd display_power 0"
-        ]
+        # ӨШІРУ: Командалар тізбегі
+        # 1. DPMS өшіру 2. HDMI қуатын кесу 3. Экранды бос (blank) қылу
+        cmd = "xset -display :0 dpms force off; vcgencmd display_power 0; xset -display :0 s activate"
     
-    results = []
-    for cmd in commands:
-        try:
-            # Әр команданы жеке орындаймыз (бірі қате берсе де, келесісі істей береді)
-            process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
-            status = "OK" if process.returncode == 0 else f"FAIL ({process.stderr.strip()})"
-            results.append(f"{cmd}: {status}")
-        except Exception as e:
-            results.append(f"{cmd}: Error ({str(e)})")
-
-    logger.info(f"🖥 Screen execution results: {results}")
-    return jsonify({"status": "executed", "details": results})
-
-   
+    try:
+        # Бірінші әдіс: Жүйелік командалар
+        process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        
+        # Екінші әдіс: Егер Ubuntu Wayland қолданса (командалық жолмен жарықтықты басқару)
+        # Бұл экранды физикалық түрде өшірмесе де, жарықтығын 0-ге түсіреді
+        brightness_val = "100" if state else "0"
+        subprocess.run(f"ddcutil setvcp 10 {brightness_val}", shell=True) # Егер ddcutil орнатылған болса
+        
+        logger.info(f"🖥 Command Sent. Result: {process.stdout} {process.stderr}")
+        return jsonify({"status": "executed", "screen": state})
+    except Exception as e:
+        logger.error(f"❌ Screen error: {e}")
+        return jsonify({"error": str(e)}), 500
+    
+    
+    
 @app.route('/led/on', methods=['POST'])
 async def set_on():
     # Қосқанда әдепкі режим (мысалы, STATIC немесе соңғысы)
