@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import subprocess 
+import os
+
 
 from quart import Quart, request, jsonify
 from bleak import BleakScanner, BleakClient
@@ -190,6 +192,7 @@ async def get_status():
     })
     
 
+
 @app.route('/screen', methods=['POST'])
 async def set_screen():
     data = await request.get_json()
@@ -197,32 +200,28 @@ async def set_screen():
     
     logger.info(f"🖥 Screen Command Received: {'ON' if state else 'OFF'}")
 
+    # Ubuntu Desktop үшін бірнеше әдіс (vcgencmd, xset, және бос экран)
     if state:
         # Экранды ҚОСУ
-        commands = [
-            "vcgencmd display_power 1",
-            "xset -display :0 dpms force on",
-            "wayland-control output HDMI-A-1 on"
-        ]
+        # 1. HDMI қуаты, 2. DPMS ояту, 3. Курсорды қайтару (егер керек болса)
+        cmd = "vcgencmd display_power 1 && xset -display :0 dpms force on && xset -display :0 s reset"
     else:
         # Экранды ӨШІРУ
-        commands = [
-            "vcgencmd display_power 0",
-            "xset -display :0 dpms force off",
-            "wayland-control output HDMI-A-1 off"
-        ]
+        # 1. HDMI қуатын кесу, 2. DPMS күшпен өшіру
+        cmd = "vcgencmd display_power 0 || xset -display :0 dpms force off"
     
-    results = []
-    for cmd in commands:
-        try:
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            results.append(f"{cmd}: {'OK' if res.returncode == 0 else 'FAIL'}")
-        except Exception as e:
-            results.append(f"{cmd}: ERROR")
+    try:
+        # DISPLAY айнымалысын көрсету маңызды (Ubuntu графикасы үшін)
+        env = os.environ.copy()
+        env["DISPLAY"] = ":0"
+        env["XAUTHORITY"] = "/run/user/1000/gdm/Xauthority" # Немесе жай ғана /home/yerniyaz/.Xauthority
 
-    logger.info(f"🖥 Screen execution results: {results}")
-    return jsonify({"status": "executed", "details": results})
-
+        process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        logger.info(f"🖥 Command result: {process.stdout} {process.stderr}")
+        return jsonify({"status": "success", "screen": state})
+    except Exception as e:
+        logger.error(f"❌ Screen error: {e}")
+        return jsonify({"error": str(e)}), 500
    
 @app.route('/led/on', methods=['POST'])
 async def set_on():
