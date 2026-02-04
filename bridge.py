@@ -197,21 +197,41 @@ async def set_screen():
     data = await request.get_json()
     state = data.get('on', True)
     
-    # Команданы бірнеше әдіспен жіберу (бірі істемесе, екіншісі істейді)
+    logger.info(f"🖥 Screen Command Received: {'ON' if state else 'OFF'}")
+
+    # Қоршаған орта айнымалыларын баптау
+    env = os.environ.copy()
+    env["DISPLAY"] = ":0"
+    # Xauthority жолын автоматты түрде анықтауға тырысамыз немесе стандартты жолды қоямыз
+    env["XAUTHORITY"] = f"/home/yerniyaz/.Xauthority" 
+
+    # Командалар тізімі
     if state:
-        # ҚОСУ (Ояту)
-        cmd = "vcgencmd display_power 1; xset -display :0 dpms force on; xset -display :0 s reset"
+        # ҚОСУ үшін бірнеше әдіс
+        commands = [
+            "vcgencmd display_power 1",
+            "xset -display :0 dpms force on",
+            "xset -display :0 s reset"
+        ]
     else:
-        # ӨШІРУ (Ұйықтату)
-        cmd = "xset -display :0 dpms force off || vcgencmd display_power 0"
+        # ӨШІРУ үшін бірнеше әдіс
+        commands = [
+            "xset -display :0 dpms force off",
+            "vcgencmd display_power 0"
+        ]
     
-    try:
-        # DISPLAY :0 көрсету маңызды
-        os.environ["DISPLAY"] = ":0"
-        subprocess.run(cmd, shell=True)
-        return jsonify({"status": "ok", "screen": state})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    results = []
+    for cmd in commands:
+        try:
+            # Әр команданы жеке орындаймыз (бірі қате берсе де, келесісі істей береді)
+            process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+            status = "OK" if process.returncode == 0 else f"FAIL ({process.stderr.strip()})"
+            results.append(f"{cmd}: {status}")
+        except Exception as e:
+            results.append(f"{cmd}: Error ({str(e)})")
+
+    logger.info(f"🖥 Screen execution results: {results}")
+    return jsonify({"status": "executed", "details": results})
 
    
 @app.route('/led/on', methods=['POST'])
