@@ -193,23 +193,37 @@ async def get_status():
 @app.route('/screen', methods=['POST'])
 async def set_screen():
     data = await request.get_json()
-    # React-тан { "on": true } немесе { "on": false } келеді
     state = data.get('on', True)
     
-    logger.info(f"🖥 Screen Command: {'ON' if state else 'OFF'}")
+    logger.info(f"🖥 Screen Command Received: {'ON' if state else 'OFF'}")
 
-    # Raspberry Pi HDMI басқару командасы
-    # vcgencmd display_power 1 (ON) / 0 (OFF)
-    cmd = "vcgencmd display_power 1" if state else "vcgencmd display_power 0"
+    if state:
+        # Экранды ҚОСУ
+        commands = [
+            "vcgencmd display_power 1",
+            "xset -display :0 dpms force on",
+            "wayland-control output HDMI-A-1 on"
+        ]
+    else:
+        # Экранды ӨШІРУ
+        commands = [
+            "vcgencmd display_power 0",
+            "xset -display :0 dpms force off",
+            "wayland-control output HDMI-A-1 off"
+        ]
     
-    try:
-        # Команданы терминалда орындаймыз
-        subprocess.run(cmd, shell=True)
-        return jsonify({"status": "success", "screen": "ON" if state else "OFF"})
-    except Exception as e:
-        logger.error(f"❌ Screen Error: {e}")
-        return jsonify({"error": str(e)}), 500
-    
+    results = []
+    for cmd in commands:
+        try:
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            results.append(f"{cmd}: {'OK' if res.returncode == 0 else 'FAIL'}")
+        except Exception as e:
+            results.append(f"{cmd}: ERROR")
+
+    logger.info(f"🖥 Screen execution results: {results}")
+    return jsonify({"status": "executed", "details": results})
+
+   
 @app.route('/led/on', methods=['POST'])
 async def set_on():
     # Қосқанда әдепкі режим (мысалы, STATIC немесе соңғысы)
