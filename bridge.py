@@ -196,37 +196,33 @@ async def set_screen():
     data = await request.get_json()
     state = data.get('on', True)
     
-    logger.info(f"🖥 Screen Command Received: {'ON' if state else 'OFF'}")
+    logger.info(f"🖥 Screen Command: {'ON' if state else 'OFF'}")
 
-    # DISPLAY айнымалыларын root үшін де, пайдаланушы үшін де жібереміз
     env = os.environ.copy()
     env["DISPLAY"] = ":0"
     env["XAUTHORITY"] = "/home/yerniyaz/.Xauthority"
 
-    if state:
-        # ҚОСУ: Командалар тізбегі
-        # 1. HDMI қуаты 2. DPMS ояту 3. Экранды "қараңғылықтан" шығару
-        cmd = "vcgencmd display_power 1; xset -display :0 dpms force on; xset -display :0 s reset; xset -display :0 s off"
-    else:
-        # ӨШІРУ: Командалар тізбегі
-        # 1. DPMS өшіру 2. HDMI қуатын кесу 3. Экранды бос (blank) қылу
-        cmd = "xset -display :0 dpms force off; vcgencmd display_power 0; xset -display :0 s activate"
-    
     try:
-        # Бірінші әдіс: Жүйелік командалар
-        process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
-        
-        # Екінші әдіс: Егер Ubuntu Wayland қолданса (командалық жолмен жарықтықты басқару)
-        # Бұл экранды физикалық түрде өшірмесе де, жарықтығын 0-ге түсіреді
-        brightness_val = "100" if state else "0"
-        subprocess.run(f"ddcutil setvcp 10 {brightness_val}", shell=True) # Егер ddcutil орнатылған болса
-        
-        logger.info(f"🖥 Command Sent. Result: {process.stdout} {process.stderr}")
+        if state:
+            # ҚОСУ: Бәрін ояту
+            subprocess.run("vcgencmd display_power 1", shell=True, env=env)
+            subprocess.run("xset -display :0 dpms force on", shell=True, env=env)
+            subprocess.run("xset -display :0 s reset", shell=True, env=env)
+        else:
+            # ӨШІРУ: Қайта жанып кетпес үшін тізбектелген әдіс
+            # 1. Скринсейверді өшіру
+            subprocess.run("xset -display :0 s off", shell=True, env=env)
+            # 2. Энергия үнемдеуді "өшіру" күйіне қою
+            subprocess.run("xset -display :0 dpms 0 0 0", shell=True, env=env)
+            # 3. Күшпен өшіру
+            subprocess.run("xset -display :0 dpms force off", shell=True, env=env)
+            # 4. HDMI-ды физикалық түрде ажырату
+            subprocess.run("vcgencmd display_power 0", shell=True, env=env)
+            
         return jsonify({"status": "executed", "screen": state})
     except Exception as e:
-        logger.error(f"❌ Screen error: {e}")
-        return jsonify({"error": str(e)}), 500
-    
+        logger.error(f"❌ Screen Error: {e}")
+        return jsonify({"error": str(e)}), 500  
     
     
 @app.route('/led/on', methods=['POST'])
