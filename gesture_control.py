@@ -7,41 +7,42 @@ import threading
 import logging
 import signal
 import sys
-from collections import deque
 
-# ================= CONFIGURATION =================
+# ================= ⚙️ НАСТРОЙКИ (TWEAK ME) =================
 CAMERA_ID = 0
-FRAME_WIDTH = 320   # Низкое разрешение для скорости RPi
+FRAME_WIDTH = 320    # Низкое разрешение для скорости RPi (не меняй)
 FRAME_HEIGHT = 240
-SMOOTHING = 5       # Коэффициент сглаживания (чем больше, тем плавнее, но медленнее)
-CLICK_THRESHOLD = 0.04
-SCROLL_THRESHOLD = 0.05  # Чувствительность для жестов стрелок
 
-# Настройки PyAutoGUI
-pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0
+# Зона комфорта (чем меньше число, тем меньше махать рукой)
+# 100 = отступ от краев кадра. Мышь будет работать только в центре.
+FRAME_REDUCTION = 60 
+
+# Настройки клика и скролла
+CLICK_THRESHOLD = 0.035  # Чувствительность щипка (меньше = сложнее кликнуть)
+SCROLL_SENSITIVITY = 15  # Скорость скролла
 
 # Логирование
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [VECTOR] - %(message)s')
-logger = logging.getLogger("GESTURE_CORE")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger("VECTOR")
 
-# ================= THREADED CAMERA =================
-class WebcamStream:
-    """
-    Захват видео в отдельном потоке. 
-    Это критично для RPi, чтобы обработка кадров не тормозила чтение с камеры.
-    """
-    def __init__(self, src=0, width=320, height=240):
+# Отключаем защиту PyAutoGUI (чтобы мышь могла биться в углы)
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.005 # Минимальная задержка
+
+# ================= 🏎 КАМЕРА В ПОТОКЕ (NO LAG) =================
+class FastWebcam:
+    def __init__(self, src=0, w=320, h=240):
         self.stream = cv2.VideoCapture(src)
-        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         self.stream.set(cv2.CAP_PROP_FPS, 30)
         (self.grabbed, self.frame) = self.stream.read()
         self.stopped = False
         self.lock = threading.Lock()
 
     def start(self):
-        threading.Thread(target=self.update, args=(), daemon=True).start()
+        t = threading.Thread(target=self.update, args=(), daemon=True)
+        t.start()
         return self
 
     def update(self):
@@ -50,7 +51,7 @@ class WebcamStream:
             with self.lock:
                 self.grabbed = grabbed
                 self.frame = frame
-            time.sleep(0.005) # Небольшая пауза, чтобы не грузить CPU вхолостую
+            time.sleep(0.005) # Даем дышать CPU
 
     def read(self):
         with self.lock:
@@ -60,198 +61,174 @@ class WebcamStream:
         self.stopped = True
         self.stream.release()
 
-# ================= GESTURE ENGINE =================
-class VectorGestureEngine:
+# ================= 🧠 МОЗГ ЖЕСТОВ =================
+class VectorBrain:
     def __init__(self):
-        # Инициализация MediaPipe с оптимизацией для CPU RPi
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            model_complexity=0, # 0 = Lite (самый быстрый), 1 = Full
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6
+            model_complexity=0, # 0 = Lite (Быстро!), 1 = Full (Точно)
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
         )
-        self.screen_w, self.screen_h = pyautogui.size()
+        self.scr_w, self.scr_h = pyautogui.size()
         
-        # Переменные для сглаживания
-        self.prev_x, self.prev_y = 0, 0
-        self.curr_x, self.curr_y = 0, 0
+        # Координаты для сглаживания
+        self.plocX, self.plocY = 0, 0
+        self.clocX, self.clocY = 0, 0
         
-        # Состояние кликов (защита от дребезга)
-        self.last_click_time = 0
-        self.click_cooldown = 0.4
-        
-        # Состояние свайпов/стрелок
-        self.last_nav_time = 0
-        self.nav_cooldown = 0.3
-        self.nav_center_x = None
-        self.nav_center_y = None
+        # Таймеры
+        self.last_click = 0
+        self.last_esc = 0
 
-    def get_dist(self, p1, p2):
-        return np.linalg.norm(np.array([p1.x, p1.y]) - np.array([p2.x, p2.y]))
+    def smooth_move(self, target_x, target_y, speed_factor):
+        """Динамическое сглаживание: быстро двигаешь - мало лага, медленно - высокая точность"""
+        # Вычисляем расстояние
+        dist = np.hypot(target_x - self.plocX, target_y - self.plocY)
+        
+        # Если движение быстрое (>50 пикселей), уменьшаем сглаживание (быстрая реакция)
+        # Если движение медленное, увеличиваем сглаживание (стабильность)
+        if dist > 50:
+            alpha = 0.7  # Быстро
+        elif dist > 20:
+            alpha = 0.4  # Средне
+        else:
+            alpha = 0.15 # Очень плавно (прицеливание)
 
-    def process_frame(self, frame):
-        # Отражаем и конвертируем
+        self.clocX = self.plocX + (target_x - self.plocX) * alpha
+        self.clocY = self.plocY + (target_y - self.plocY) * alpha
+        
+        # Ограничиваем экраном
+        self.clocX = np.clip(self.clocX, 0, self.scr_w)
+        self.clocY = np.clip(self.clocY, 0, self.scr_h)
+        
+        pyautogui.moveTo(self.clocX, self.clocY)
+        self.plocX, self.plocY = self.clocX, self.clocY
+
+    def process(self, frame):
+        # Отражаем зеркально (чтобы право было правом)
         frame = cv2.flip(frame, 1)
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(img_rgb)
+        h, w, c = frame.shape
         
-        action_log = None
+        # Отрисовка "Зоны комфорта" (для отладки можно включить imshow, но на RPi не увидишь)
+        # cv2.rectangle(frame, (FRAME_REDUCTION, FRAME_REDUCTION), 
+        #               (w - FRAME_REDUCTION, h - FRAME_REDUCTION), (255, 0, 255), 2)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb)
+
+        status = "IDLE"
 
         if results.multi_hand_landmarks:
             for hand_lms in results.multi_hand_landmarks:
-                # Ключевые точки
-                wrist = hand_lms.landmark[0]
-                thumb_tip = hand_lms.landmark[4]
-                index_tip = hand_lms.landmark[8]
-                middle_tip = hand_lms.landmark[12]
-                ring_tip = hand_lms.landmark[16]
-                pinky_tip = hand_lms.landmark[20]
-
-                # --- РАСПОЗНАВАНИЕ ЖЕСТОВ ---
-
-                # 1. Проверка на КУЛАК (Fist) -> ESC
-                # Логика: кончики пальцев ниже суставов или близко к ладони
-                fingers_folded = (
-                    index_tip.y > hand_lms.landmark[6].y and
-                    middle_tip.y > hand_lms.landmark[10].y and
-                    ring_tip.y > hand_lms.landmark[14].y and
-                    pinky_tip.y > hand_lms.landmark[18].y
-                )
-
-                if fingers_folded:
-                    if time.time() - self.last_click_time > 1.0: # Долгий кулдаун для ESC
+                # Точки
+                idx_tip = hand_lms.landmark[8]   # Указательный
+                mid_tip = hand_lms.landmark[12]  # Средний
+                thumb_tip = hand_lms.landmark[4] # Большой
+                wrist = hand_lms.landmark[0]     # Запястье
+                
+                # Координаты кончика указательного пальца (0.0 - 1.0)
+                x1, y1 = idx_tip.x, idx_tip.y
+                
+                # Проверка пальцев (поднят или нет)
+                # Если кончик пальца выше сустава (y меньше, т.к. 0 вверху)
+                idx_up = idx_tip.y < hand_lms.landmark[6].y
+                mid_up = mid_tip.y < hand_lms.landmark[10].y
+                ring_down = hand_lms.landmark[16].y > hand_lms.landmark[14].y
+                pinky_down = hand_lms.landmark[20].y > hand_lms.landmark[18].y
+                
+                # 1. 🛑 ЖЕСТ: КУЛАК (ESC)
+                # Все пальцы согнуты
+                if not idx_up and not mid_up and ring_down and pinky_down:
+                    if time.time() - self.last_esc > 2.0: # Раз в 2 секунды
                         pyautogui.press('esc')
-                        self.last_click_time = time.time()
-                        return "🔐 ESCAPE"
-                    return "✊ FIST (Wait)"
+                        self.last_esc = time.time()
+                        logger.info("🔐 ESCAPE PRESSED")
+                    return "FIST (ESC)"
 
-                # 2. Режим НАВИГАЦИИ (Victory/Peace sign) -> Стрелки
-                # Указательный и Средний подняты, остальные согнуты
-                is_nav_mode = (
-                    index_tip.y < hand_lms.landmark[6].y and
-                    middle_tip.y < hand_lms.landmark[10].y and
-                    ring_tip.y > hand_lms.landmark[14].y and
-                    pinky_tip.y > hand_lms.landmark[18].y
-                )
-
-                if is_nav_mode:
-                    # Центр ладони для трекинга движения
-                    cx, cy = wrist.x, wrist.y
+                # 2. ↕️ ЖЕСТ: ДВА ПАЛЬЦА (СКРОЛЛ / СТРЕЛКИ)
+                # Указательный и Средний подняты (Victory sign)
+                if idx_up and mid_up and ring_down:
+                    # Конвертируем координаты в скролл
+                    # Используем относительное положение пальцев в кадре
+                    # Центр кадра = покой. Выше центра = скролл вверх.
                     
-                    if self.nav_center_x is None:
-                        self.nav_center_x, self.nav_center_y = cx, cy
-                        return "🕹 NAV START"
+                    dy = y1 - 0.5 # Отклонение от центра по Y
+                    dx = x1 - 0.5 # Отклонение от центра по X
                     
-                    dx = cx - self.nav_center_x
-                    dy = cy - self.nav_center_y
+                    if abs(dy) > 0.1: # Мертвая зона
+                        scroll_amount = int(dy * SCROLL_SENSITIVITY * -10) # -10 инверсия
+                        # Скролл вертикальный
+                        pyautogui.scroll(scroll_amount)
+                        status = "SCROLL V"
                     
-                    if time.time() - self.last_nav_time > self.nav_cooldown:
-                        if dx > SCROLL_THRESHOLD:
-                            pyautogui.press('right')
-                            action_log = "➡️ RIGHT"
-                            self.last_nav_time = time.time()
-                        elif dx < -SCROLL_THRESHOLD:
-                            pyautogui.press('left')
-                            action_log = "⬅️ LEFT"
-                            self.last_nav_time = time.time()
-                        elif dy > SCROLL_THRESHOLD:
-                            pyautogui.press('down')
-                            action_log = "⬇️ DOWN"
-                            self.last_nav_time = time.time()
-                        elif dy < -SCROLL_THRESHOLD:
-                            pyautogui.press('up')
-                            action_log = "⬆️ UP"
-                            self.last_nav_time = time.time()
+                    if abs(dx) > 0.15: # Для горизонтальных стрелок (влево/вправо)
+                         if time.time() - self.last_click > 0.3:
+                            if dx > 0: pyautogui.press('right')
+                            else: pyautogui.press('left')
+                            self.last_click = time.time()
+                            status = "SWIPE H"
                     
-                    return action_log if action_log else "🕹 NAVIGATING..."
+                    return status
 
-                else:
-                    self.nav_center_x = None # Сброс центра навигации
+                # 3. 🖱 ЖЕСТ: УКАЗАТЕЛЬНЫЙ (МЫШЬ)
+                # Только указательный поднят (или указательный+большой)
+                if idx_up and not mid_up:
+                    # Преобразование координат с учетом "Зоны комфорта"
+                    # Interpolate: from (Reduction, W-Reduction) to (0, ScreenW)
+                    mapped_x = np.interp(x1 * w, (FRAME_REDUCTION, w - FRAME_REDUCTION), (0, self.scr_w))
+                    mapped_y = np.interp(y1 * h, (FRAME_REDUCTION, h - FRAME_REDUCTION), (0, self.scr_h))
 
-                # 3. Режим КУРСОРА (только указательный палец поднят)
-                # Двигаем курсор
-                x = int(index_tip.x * self.screen_w)
-                y = int(index_tip.y * self.screen_h)
+                    # Двигаем мышь (с динамическим сглаживанием)
+                    self.smooth_move(mapped_x, mapped_y, 0)
 
-                # Сглаживание (Linear Interpolation)
-                self.curr_x = self.prev_x + (x - self.prev_x) / SMOOTHING
-                self.curr_y = self.prev_y + (y - self.prev_y) / SMOOTHING
-                
-                # Ограничение экрана
-                self.curr_x = np.clip(self.curr_x, 0, self.screen_w - 1)
-                self.curr_y = np.clip(self.curr_y, 0, self.screen_h - 1)
+                    # 4. 🤏 ЖЕСТ: КЛИК (ЩИПОК)
+                    # Расстояние между большим и указательным
+                    dist = np.hypot(idx_tip.x - thumb_tip.x, idx_tip.y - thumb_tip.y)
+                    
+                    if dist < CLICK_THRESHOLD:
+                        if time.time() - self.last_click > 0.3: # Анти-дребезг
+                            pyautogui.click()
+                            self.last_click = time.time()
+                            logger.info("🖱 CLICK")
+                            return "CLICK"
+                    
+                    return "CURSOR"
 
-                pyautogui.moveTo(self.curr_x, self.curr_y)
-                self.prev_x, self.prev_y = self.curr_x, self.curr_y
+        return status
 
-                # --- КЛИКИ ---
-                
-                # Левый клик: Указательный + Большой
-                dist_l = self.get_dist(index_tip, thumb_tip)
-                if dist_l < CLICK_THRESHOLD:
-                    if time.time() - self.last_click_time > self.click_cooldown:
-                        pyautogui.click()
-                        self.last_click_time = time.time()
-                        return "🖱 LEFT CLICK"
-
-                # Правый клик: Средний + Большой
-                dist_r = self.get_dist(middle_tip, thumb_tip)
-                if dist_r < CLICK_THRESHOLD:
-                    if time.time() - self.last_click_time > self.click_cooldown:
-                        pyautogui.rightClick()
-                        self.last_click_time = time.time()
-                        return "🖱 RIGHT CLICK"
-        
-        return None
-
-# ================= MAIN LOOP =================
-def run_vector_vision():
-    logger.info("🚀 VECTOR Vision Engine Starting...")
-    logger.info("   -> Mode: Optimized for RPi 4/5")
-    logger.info("   -> Gestures: Pointer, Pinches(L/R), Victory(Nav), Fist(Esc)")
+# ================= 🚀 ЗАПУСК =================
+def main():
+    logger.info("🚀 VECTOR GESTURE PRO STARTED")
+    cam = FastWebcam(src=CAMERA_ID, w=FRAME_WIDTH, h=FRAME_HEIGHT).start()
+    brain = VectorBrain()
+    
+    # Ждем прогрева камеры
+    time.sleep(1)
 
     try:
-        # Запуск камеры в потоке
-        cam = WebcamStream(src=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT).start()
-        # Инициализация движка жестов
-        engine = VectorGestureEngine()
-        
-        # Даем камере прогреться
-        time.sleep(1.0)
-        
-        running = True
-        
-        while running:
+        while True:
             frame = cam.read()
-            if frame is None:
-                time.sleep(0.1)
-                continue
-
-            # Обработка
-            status = engine.process_frame(frame)
-            if status:
-                logger.info(f"Action: {status}")
-
-            # Небольшой сон для разгрузки CPU, если FPS слишком высок (опционально)
-            # time.sleep(0.001)
+            if frame is None: continue
+            
+            brain.process(frame)
+            
+            # Небольшой sleep не нужен, так как FastWebcam регулирует FPS, 
+            # но для разгрузки CPU на 100% загрузке добавим мизер
+            # time.sleep(0.001) 
 
     except KeyboardInterrupt:
-        logger.info("🛑 Stopping by user request...")
-    except Exception as e:
-        logger.error(f"💥 CRITICAL ERROR: {e}")
+        pass
     finally:
-        if 'cam' in locals():
-            cam.stop()
-        logger.info("👋 System Shutdown")
-        sys.exit(0)
+        cam.stop()
+        logger.info("🛑 STOPPED")
 
-# Обработчик сигналов для systemd
+# Обработчик убийства процесса (для systemd)
 def signal_handler(sig, frame):
     sys.exit(0)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    run_vector_vision()
+    main()
