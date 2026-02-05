@@ -5,8 +5,9 @@ import asyncio
 import logging
 import signal
 import sys
+import os
 
-# Настройка логирования в стиле VECTOR
+# Настройка логов
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("VECTOR_GESTURE")
 
@@ -19,22 +20,20 @@ class VectorGestureMouse:
             min_detection_confidence=0.7,
             min_tracking_confidence=0.5
         )
+        # Настройки экрана
         self.screen_w, self.screen_h = pyautogui.size()
         self.cap = None
         self.running = True
         
-        # Настройки чувствительности
-        self.smoothening = 7
+        # Сглаживание (чтобы курсор не дрожал на зеркале)
+        self.smoothening = 5
         self.plocX, self.plocY = 0, 0
-        self.clocX, self.clocY = 0, 0
         
         pyautogui.FAILSAFE = False
 
     async def start(self):
-        logger.info("🚀 Starting Gesture Control System...")
+        logger.info("🚀 Запуск системы жестов VECTOR...")
         self.cap = cv2.VideoCapture(0)
-        
-        # Оптимизация для Raspberry Pi (низкое разрешение = высокая скорость)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
@@ -42,7 +41,6 @@ class VectorGestureMouse:
             while self.running:
                 success, img = self.cap.read()
                 if not success:
-                    logger.error("❌ Camera Frame Error")
                     await asyncio.sleep(1)
                     continue
 
@@ -52,56 +50,48 @@ class VectorGestureMouse:
 
                 if results.multi_hand_landmarks:
                     for hand_lms in results.multi_hand_landmarks:
-                        # Указательный палец (Index Finger Tip)
-                        index_finger = hand_lms.landmark[8]
+                        # Указательный палец (Index Tip)
+                        index_tip = hand_lms.landmark[8]
                         # Большой палец (Thumb Tip)
-                        thumb_finger = hand_lms.landmark[4]
+                        thumb_tip = hand_lms.landmark[4]
 
-                        # Координаты на экране
-                        fx = int(index_finger.x * self.screen_w)
-                        fy = int(index_finger.y * self.screen_h)
+                        # Масштабирование
+                        fx = int(index_tip.x * self.screen_w)
+                        fy = int(index_tip.y * self.screen_h)
 
-                        # Сглаживание движения (чтобы курсор не дрожал)
-                        self.clocX = self.plocX + (fx - self.plocX) / self.smoothening
-                        self.clocY = self.plocY + (fy - self.plocY) / self.smoothening
+                        # Плавное движение
+                        clocX = self.plocX + (fx - self.plocX) / self.smoothening
+                        clocY = self.plocY + (fy - self.plocY) / self.smoothening
                         
-                        pyautogui.moveTo(self.clocX, self.clocY, _pause=False)
-                        self.plocX, self.plocY = self.clocX, self.clocY
+                        pyautogui.moveTo(clocX, clocY, _pause=False)
+                        self.plocX, self.plocY = clocX, clocY
 
-                        # Логика клика (расстояние между 4 и 8 пальцами)
-                        dist = ((index_finger.x - thumb_finger.x)**2 + (index_finger.y - thumb_finger.y)**2)**0.5
+                        # Клик при соединении большого и указательного пальцев
+                        dist = ((index_tip.x - thumb_tip.x)**2 + (index_tip.y - thumb_tip.y)**2)**0.5
                         if dist < 0.05:
                             pyautogui.click()
-                            logger.info("🖱 Gesture Click!")
-                            await asyncio.sleep(0.2) # Защита от двойного клика
+                            logger.info("🖱 Жест: Клик!")
+                            await asyncio.sleep(0.3) 
 
                 await asyncio.sleep(0.01)
-
         except Exception as e:
-            logger.error(f"💥 Crash: {e}")
+            logger.error(f"💥 Ошибка: {e}")
         finally:
             self.stop()
 
     def stop(self):
         self.running = False
-        if self.cap:
-            self.cap.release()
-        logger.info("🛑 Gesture System Stopped")
-
-# Глобальный обработчик завершения (для systemd)
-def signal_handler(sig, frame):
-    controller.stop()
-    sys.exit(0)
+        if self.cap: self.cap.release()
+        logger.info("🛑 Система жестов остановлена")
 
 if __name__ == "__main__":
     controller = VectorGestureMouse()
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
     
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(controller.start())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        loop.close()
+    def shutdown(sig, frame):
+        controller.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    
+    asyncio.run(controller.start())
