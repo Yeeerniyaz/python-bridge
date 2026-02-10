@@ -2,400 +2,307 @@
 # -*- coding: utf-8 -*-
 
 """
-VECTOR GESTURE CONTROL - TITAN EDITION (v8.0)
-=============================================
-Target:     Raspberry Pi 4/5 / Linux / Production
-Author:     Vector AI (Gemini) for Yerniyaz
-Mechanic:   "The Gunner" (Index to Aim, Thumb+Middle to Click)
-Status:     Production Ready
+VECTOR GESTURE CONTROL - DUAL MODE (v9.0)
+=========================================
+Режимы:
+1. COMPUTER (Оранжевый): Курсор + Щипок (Клик)
+2. CINEMA (Синий): Взмахи (Листать) + Кулак (Enter)
+3. GLOBAL: Громкость (справа), Пауза (Ладонь), Выход (Шака)
 """
 
 import cv2
 import mediapipe as mp
 import pyautogui
-import numpy as np
+import math
 import time
+import numpy as np
+import urllib.request
+import json
 import threading
 import logging
-import signal
-import sys
-import math
-from dataclasses import dataclass
-from typing import Tuple, Optional, Any
 
-# ==============================================================================
-# 1. SYSTEM CONFIGURATION (НАСТРОЙКИ ЯДРА)
-# ==============================================================================
+# --- КОНФИГУРАЦИЯ ---
+CAMERA_ID = 0
+WIDTH, HEIGHT = 640, 480
+BRIDGE_URL = "http://localhost:5005"  # Адрес твоего bridge.py
 
-@dataclass
-class SystemConfig:
-    """Immutable system configuration."""
-    
-    # --- Camera & Hardware ---
-    CAMERA_ID: int = 0
-    WIDTH: int = 640        # Input Resolution
-    HEIGHT: int = 480
-    FPS: int = 30
-    
-    # --- Interaction Zone (Virtual Pad) ---
-    # Отступы, чтобы курсор долетал до углов экрана без напряжения руки
-    MARGIN_X: int = 80      
-    MARGIN_Y: int = 70
-    
-    # --- Physics & Stabilization ---
-    # Мертвая зона: движение меньше 3px игнорируется (бетонная устойчивость)
-    DEADZONE: float = 3.0   
-    # Сглаживание: 0.1 (плавно) -> 0.5 (резко)
-    SMOOTH_ALPHA: float = 0.15 
-    
-    # --- GESTURE THRESHOLDS (Самое важное!) ---
-    # TRIGGER = Расстояние между БОЛЬШИМ (4) и СРЕДНИМ (12) пальцами
-    # Я увеличил пороги, чтобы клик срабатывал легче!
-    TRIGGER_START: float = 0.055  # Клик, когда пальцы почти коснулись
-    TRIGGER_STOP: float = 0.080   # Отпускание, когда пальцы разошлись
-    
-    # --- Timers ---
-    NAV_COOLDOWN: float = 0.5     # Задержка между свайпами
-    ESC_HOLD_TIME: float = 2.5    # Время удержания кулака
+# Чувствительность
+CLICK_DIST = 0.045     # Расстояние для клика (щипок)
+SWIPE_THRESH = 60      # Пикселей для фиксации взмаха
+VOL_EDGE_X = 0.92      # Зона громкости (92% ширины экрана и правее)
+MODE_HOLD_TIME = 1.5   # Сколько держать лайк для смены режима
 
-config = SystemConfig()
-
-# ==============================================================================
-# 2. LOGGING & MATH UTILS (ИНСТРУМЕНТАРИЙ)
-# ==============================================================================
-
-# Professional Logging Setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s | %(name)s: %(message)s',
-    datefmt='%H:%M:%S'
-)
+# Логирование
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger("VECTOR")
 
-# PyAutoGUI Safety Off (Kiosk Mode)
 pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0.001
 
-class MathUtils:
-    """Geometric calculations library."""
-    
+class VectorLED:
+    """Отправляет команды на bridge.py без задержки видео"""
     @staticmethod
-    def calc_distance(p1, p2) -> float:
-        """Euclidean distance between two landmarks."""
-        return math.hypot(p1.x - p2.x, p1.y - p2.y)
+    def send(endpoint, data):
+        def _req():
+            try:
+                url = f"{BRIDGE_URL}{endpoint}"
+                req = urllib.request.Request(url, 
+                    data=json.dumps(data).encode('utf-8'), 
+                    headers={'Content-Type': 'application/json'})
+                urllib.request.urlopen(req, timeout=0.1)
+            except:
+                pass # Если бридж не отвечает, не вешаем систему
+        threading.Thread(target=_req, daemon=True).start()
 
     @staticmethod
-    def map_coords(val_x: float, val_y: float, scr_w: int, scr_h: int) -> Tuple[int, int]:
-        """
-        Maps normalized camera coordinates (0.0-1.0) to screen pixels.
-        Applies margins to allow reaching screen corners easily.
-        """
-        # 1. Remap (Interpolate)
-        x = np.interp(val_x * config.WIDTH, 
-                      [config.MARGIN_X, config.WIDTH - config.MARGIN_X], 
-                      [0, scr_w])
-        y = np.interp(val_y * config.HEIGHT, 
-                      [config.MARGIN_Y, config.HEIGHT - config.MARGIN_Y], 
-                      [0, scr_h])
-        
-        # 2. Clamp (Safety bounds)
-        return int(np.clip(x, 0, scr_w)), int(np.clip(y, 0, scr_h))
+    def blink(color_rgb):
+        # Отправляем цвет и через секунду возвращаем статику (опционально)
+        VectorLED.send('/led/color', {'color': color_rgb})
 
-class FPSMeter:
-    """Performance monitoring tool."""
+class GestureMode:
+    COMPUTER = "COMPUTER"  # Оранжевый
+    CINEMA = "CINEMA"      # Синий
+
+class VectorBrain:
     def __init__(self):
-        self.prev = 0
-        self.fps = 0
-    
-    def tick(self):
-        curr = time.time()
-        delta = curr - self.prev
-        if delta > 1.0: # Update every second
-            self.fps = int(1 / (curr - self.prev + 0.0001)) # avoid div/0
-            self.prev = curr
-        return self.fps
-
-# ==============================================================================
-# 3. THREADED CAMERA DRIVER (ДРАЙВЕР КАМЕРЫ)
-# ==============================================================================
-
-class CameraThread:
-    """
-    Runs video capture in a separate CPU thread.
-    This prevents the AI processing from slowing down the camera feed.
-    """
-    def __init__(self, src: int = 0):
-        self.src = src
-        self.cap = cv2.VideoCapture(self.src)
-        self._configure()
-        
-        self.frame = None
-        self.grabbed = False
-        self.stopped = False
-        self.lock = threading.Lock()
-        
-        # Start background thread
-        threading.Thread(target=self._update, daemon=True).start()
-
-    def _configure(self):
-        """Hardware configuration."""
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS, config.FPS)
-
-    def _update(self):
-        """Thread loop."""
-        while not self.stopped:
-            if not self.cap.isOpened():
-                time.sleep(1) # Wait before retry
-                self.cap.open(self.src)
-                continue
-                
-            grabbed, frame = self.cap.read()
-            with self.lock:
-                if grabbed:
-                    self.grabbed = True
-                    self.frame = frame
-                else:
-                    self.grabbed = False
-            
-            # Yield execution to allow other threads to run
-            time.sleep(0.002)
-
-    def read(self):
-        """Thread-safe read."""
-        with self.lock:
-            return self.frame.copy() if self.grabbed and self.frame is not None else None
-
-    def stop(self):
-        self.stopped = True
-        self.cap.release()
-        logger.info("Camera Service Stopped.")
-
-# ==============================================================================
-# 4. VECTOR ENGINE (МОЗГ СИСТЕМЫ)
-# ==============================================================================
-
-class VectorEngine:
-    """
-    The central logic processor.
-    Implements the 'Separate Trigger' mechanic.
-    """
-    def __init__(self):
-        # MediaPipe Initialization (Lite model for RPi optimization)
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
             max_num_hands=1,
-            model_complexity=0, 
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6
+            model_complexity=0,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
         )
-        self.screen_w, self.screen_h = pyautogui.size()
+        self.scr_w, self.scr_h = pyautogui.size()
         
-        # Cursor Physics State
-        self.prev_x, self.prev_y = 0.0, 0.0
+        # Состояние
+        self.mode = GestureMode.COMPUTER
         self.is_dragging = False
+        self.prev_x, self.prev_y = 0, 0 # Для сглаживания курсора
         
-        # Gesture Logic State
-        self.nav_anchor = None
-        self.nav_timer = 0
-        self.fist_timer = 0
-        
-        logger.info(f"Engine Online. Screen: {self.screen_w}x{self.screen_h}")
+        # Таймеры и флаги
+        self.mode_timer = 0
+        self.swipe_cooldown = 0
+        self.last_vol_y = 0
+        self.vol_active = False
 
-    def _move_cursor(self, raw_x: float, raw_y: float):
-        """
-        Calculates screen position with Smoothing and Deadzone.
-        """
-        # 1. Convert Camera -> Screen
-        target_x, target_y = MathUtils.map_coords(
-            raw_x, raw_y, self.screen_w, self.screen_h
-        )
+    def get_fingers(self, lms):
+        """Возвращает список [1,0,0,0,0] - какие пальцы подняты"""
+        # Порядок: Большой, Указ, Средний, Безым, Мизинец
+        tips = [4, 8, 12, 16, 20]
+        fingers = []
         
-        # 2. Exponential Moving Average (Smoothing)
-        smooth_x = self.prev_x + (target_x - self.prev_x) * config.SMOOTH_ALPHA
-        smooth_y = self.prev_y + (target_y - self.prev_y) * config.SMOOTH_ALPHA
+        # Большой палец (проверка по X для правой руки, упрощенно)
+        if lms[4].x < lms[3].x: fingers.append(1)
+        else: fingers.append(0)
         
-        # 3. Deadzone Filter (Anti-Jitter)
-        # Если рука дрожит меньше чем на DEADZONE пикселей — курсор стоит.
-        dx = abs(smooth_x - self.prev_x)
-        dy = abs(smooth_y - self.prev_y)
-        
-        if dx > config.DEADZONE or dy > config.DEADZONE:
-            pyautogui.moveTo(smooth_x, smooth_y)
-            self.prev_x, self.prev_y = smooth_x, smooth_y
+        # Остальные (проверка по Y, так как верх экрана это 0)
+        for id in tips[1:]:
+            if lms[id].y < lms[id-2].y: fingers.append(1)
+            else: fingers.append(0)
+        return fingers
 
-    def process(self, frame: np.ndarray):
-        """Main recognition loop."""
-        
-        # Pre-process image
-        if frame.shape[1] != config.WIDTH:
-            frame = cv2.resize(frame, (config.WIDTH, config.HEIGHT))
-        
-        frame = cv2.flip(frame, 1) # Mirror effect
+    def get_dist(self, p1, p2):
+        return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+    def process_frame(self, frame):
+        # Подготовка
+        frame = cv2.flip(frame, 1)
+        h, w, c = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = self.hands.process(rgb)
+
+        if not res.multi_hand_landmarks:
+            return frame
+
+        lms = res.multi_hand_landmarks[0].landmark
+        fingers = self.get_fingers(lms)
         
-        # Inference
-        results = self.hands.process(rgb)
+        # Координаты ключевых точек
+        idx_x, idx_y = int(lms[8].x * w), int(lms[8].y * h) # Кончик указательного
+        thumb_tip = lms[4]
+        index_tip = lms[8]
+        
+        # ==========================================
+        # 1. ГЛОБАЛЬНЫЕ ЖЕСТЫ (Приоритет №1)
+        # ==========================================
+        
+        # A. Смена режима (👍 ЛАЙК)
+        # Условие: Большой палец поднят, остальные (кроме может быть указательного) сжаты? 
+        # Проще: Большой палец оттопырен, а мизинец и безымянный точно прижаты
+        is_like = fingers[0] == 1 and fingers[3] == 0 and fingers[4] == 0
+        
+        if is_like:
+            if self.mode_timer == 0: self.mode_timer = time.time()
+            elif time.time() - self.mode_timer > MODE_HOLD_TIME:
+                # ПЕРЕКЛЮЧЕНИЕ
+                if self.mode == GestureMode.COMPUTER:
+                    self.mode = GestureMode.CINEMA
+                    logger.info("🔵 MODE: CINEMA")
+                    VectorLED.blink([0, 0, 255]) # Синий
+                else:
+                    self.mode = GestureMode.COMPUTER
+                    logger.info("🟠 MODE: COMPUTER")
+                    VectorLED.blink([255, 100, 0]) # Оранжевый
+                self.mode_timer = 0 # Сброс
+                time.sleep(1) # Задержка чтобы не мигало
+                return frame
+        else:
+            self.mode_timer = 0
 
-        # --- No Hands Safety ---
-        if not results.multi_hand_landmarks:
-            if self.is_dragging:
-                pyautogui.mouseUp()
-                self.is_dragging = False
-                logger.warning("Tracking Lost -> Drag Released")
-            self.fist_timer = 0
-            return
+        # B. Громкость (Слайдер справа)
+        # Если указательный палец в зоне 92% ширины
+        if lms[8].x > VOL_EDGE_X:
+            current_y = lms[8].y
+            if not self.vol_active:
+                self.vol_active = True
+                self.last_vol_y = current_y
+                logger.info("🔊 VOL: Active")
+            else:
+                diff = self.last_vol_y - current_y # Вверх (+), Вниз (-)
+                if abs(diff) > 0.05: # Шаг чувствительности
+                    if diff > 0: pyautogui.press('volumeup')
+                    else: pyautogui.press('volumedown')
+                    self.last_vol_y = current_y
+            return frame # Выходим, чтобы не двигать курсор
+        else:
+            self.vol_active = False
 
-        # --- Hand Detected ---
-        for hand_lms in results.multi_hand_landmarks:
-            lms = hand_lms.landmark
-            now = time.time()
+        # C. Пауза (🖐️ ЛАДОНЬ)
+        if sum(fingers) == 5:
+             if time.time() - self.swipe_cooldown > 1.0:
+                 pyautogui.press('space')
+                 logger.info("🖐️ PAUSE/PLAY")
+                 VectorLED.blink([255, 255, 255]) # Белый
+                 self.swipe_cooldown = time.time()
+             return frame
 
-            # Finger States (1=Up, 0=Down)
-            # 8=Index, 12=Middle, 16=Ring, 20=Pinky
-            # Note: We compare Y coordinates (lower Y is higher on screen)
-            fingers = [1 if lms[tip].y < lms[tip-2].y else 0 for tip in [8, 12, 16, 20]]
-            up_count = sum(fingers)
-            
-            # --- CRITICAL VARIABLES ---
-            # 1. Aiming Point: Index Finger Tip (8)
-            aim_point = lms[8]
-            
-            # 2. Trigger Distance: Thumb (4) <-> Middle Finger (12)
-            trigger_dist = MathUtils.calc_distance(lms[4], lms[12])
+        # D. Выход / Назад (🤙 ШАКА)
+        # Большой и мизинец подняты, середина прижата
+        if fingers[0] == 1 and fingers[4] == 1 and fingers[2] == 0:
+             if time.time() - self.swipe_cooldown > 2.0:
+                 pyautogui.press('esc')
+                 logger.info("🤙 ESCAPE")
+                 VectorLED.blink([255, 0, 0]) # Красный миг
+                 self.swipe_cooldown = time.time()
+             return frame
 
-            # ==================================================================
-            # MODE 1: AIM & SHOOT (Index Up)
-            # ==================================================================
-            # Указательный палец управляет курсором.
-            # Большой + Средний управляют кликом.
-            
-            if fingers[0]: # Если Указательный поднят
+        # ==========================================
+        # 2. РЕЖИМ КОМПЬЮТЕР (Точность)
+        # ==========================================
+        if self.mode == GestureMode.COMPUTER:
+            # Движение курсора (только если поднят указательный)
+            if fingers[1] == 1:
+                # Интерполяция координат (экранные)
+                # Делаем зону чуть меньше (Margin), чтобы доставать до краев
+                margin = 50
+                scr_x = np.interp(idx_x, [margin, w-margin], [0, self.scr_w])
+                scr_y = np.interp(idx_y, [margin, h-margin], [0, self.scr_h])
                 
-                # A. Двигаем курсор (Всегда!)
-                self._move_cursor(aim_point.x, aim_point.y)
+                # Сглаживание (Smoothing)
+                curr_x = self.prev_x + (scr_x - self.prev_x) * 0.2
+                curr_y = self.prev_y + (scr_y - self.prev_y) * 0.2
+                
+                pyautogui.moveTo(curr_x, curr_y)
+                self.prev_x, self.prev_y = curr_x, curr_y
 
-                # B. Проверяем Триггер (Клик)
-                if trigger_dist < config.TRIGGER_START:
+                # Клик (Щипок)
+                dist = self.get_dist(thumb_tip, index_tip)
+                if dist < CLICK_DIST:
                     if not self.is_dragging:
                         pyautogui.mouseDown()
                         self.is_dragging = True
-                        logger.info("💥 CLICK (Trigger Active)")
-                
-                elif trigger_dist > config.TRIGGER_STOP:
+                        VectorLED.blink([0, 255, 0]) # Зеленый
+                        logger.info("👌 CLICK DOWN")
+                else:
                     if self.is_dragging:
                         pyautogui.mouseUp()
                         self.is_dragging = False
-                        logger.info("💨 RELEASE (Trigger Reset)")
-                
-                return # Выходим, чтобы другие жесты не мешали
+                        logger.info("👌 CLICK UP")
 
-            # ==================================================================
-            # MODE 2: NAVIGATION (Victory Sign)
-            # ==================================================================
-            # Указательный и Средний подняты. 
-            # ВАЖНО: Триггер должен быть разомкнут (дистанция > 0.1), иначе это клик
+        # ==========================================
+        # 3. РЕЖИМ КИНОТЕАТР (YouTube)
+        # ==========================================
+        elif self.mode == GestureMode.CINEMA:
+            # ENTER (Кулак ✊)
+            if sum(fingers) == 0: # Все пальцы сжаты
+                if time.time() - self.swipe_cooldown > 1.5:
+                    pyautogui.press('enter')
+                    logger.info("✊ ENTER")
+                    VectorLED.blink([0, 255, 0]) # Зеленый
+                    self.swipe_cooldown = time.time()
             
-            if fingers[0] and fingers[1] and trigger_dist > 0.1:
-                if self.is_dragging: pyautogui.mouseUp(); self.is_dragging = False
-                
-                curr = (lms[9].x, lms[9].y) # Центр ладони
-                if self.nav_anchor is None: self.nav_anchor = curr
-                else:
-                    dx = curr[0] - self.nav_anchor[0]
-                    dy = curr[1] - self.nav_anchor[1]
+            # СВАЙПЫ (Листание)
+            # Отслеживаем движение центра ладони (9 точка)
+            cx, cy = int(lms[9].x * w), int(lms[9].y * h)
+            
+            # Для определения свайпа нам нужна история позиций.
+            # Но в простом варианте можно использовать скорость указательного пальца
+            # Или просто использовать относительное смещение курсора (виртуального)
+            
+            # Простая реализация: 
+            # Если рука быстро сместилась относительно предыдущего кадра (который мы не храним в классе явно для свайпа, 
+            # но можем использовать prev_x из режима компьютера как "последнюю известную точку")
+            
+            # Лучше использовать статический буфер внутри функции или класса
+            if not hasattr(self, 'last_sw_x'): 
+                self.last_sw_x = cx
+                self.last_sw_y = cy
+                self.last_sw_time = time.time()
+
+            # Вычисляем дельту
+            dx = cx - self.last_sw_x
+            dy = cy - self.last_sw_y
+            
+            if time.time() - self.swipe_cooldown > 0.6: # Кулдаун между свайпами
+                if abs(dx) > SWIPE_THRESH:
+                    if dx > 0: 
+                        pyautogui.press('right') # Вправо (для YouTube это +5 сек или след видео в фокусе)
+                        logger.info("➡️ SWIPE RIGHT")
+                    else: 
+                        pyautogui.press('left')
+                        logger.info("⬅️ SWIPE LEFT")
+                    self.swipe_cooldown = time.time()
                     
-                    if now - self.nav_timer > config.NAV_COOLDOWN:
-                        if abs(dx) > 0.05: # Порог свайпа по X
-                            key = 'right' if dx > 0 else 'left'
-                            pyautogui.press(key)
-                            logger.info(f"Nav: {key.upper()}")
-                            self.nav_timer = now; self.nav_anchor = curr
-                        elif abs(dy) > 0.05: # Порог свайпа по Y
-                            key = 'down' if dy > 0 else 'up'
-                            pyautogui.press(key)
-                            logger.info(f"Nav: {key.upper()}")
-                            self.nav_timer = now; self.nav_anchor = curr
-                return
-            else:
-                self.nav_anchor = None
+                elif abs(dy) > SWIPE_THRESH:
+                    if dy > 0: 
+                        pyautogui.press('down')
+                        logger.info("⬇️ SWIPE DOWN")
+                    else: 
+                        pyautogui.press('up')
+                        logger.info("⬆️ SWIPE UP")
+                    self.swipe_cooldown = time.time()
 
-            # ==================================================================
-            # MODE 3: SYSTEM EXIT (Fist / 0 Fingers)
-            # ==================================================================
-            if up_count == 0:
-                if self.fist_timer == 0: self.fist_timer = now
-                elif now - self.fist_timer > config.ESC_HOLD_TIME:
-                    pyautogui.press('esc')
-                    logger.warning("🔐 SYSTEM: ESCAPE EXECUTED")
-                    self.fist_timer = 0
-            else:
-                self.fist_timer = 0
+            # Обновляем "предыдущую" точку
+            self.last_sw_x = cx
+            self.last_sw_y = cy
 
-            # ==================================================================
-            # MODE 4: IDLE (Palm Open / 3+ Fingers)
-            # ==================================================================
-            if up_count >= 3:
-                # Просто двигаем курсор, без кликов
-                if self.is_dragging: pyautogui.mouseUp(); self.is_dragging = False
-                self._move_cursor(lms[9].x, lms[9].y)
-
-# ==============================================================================
-# 5. RUNNER (ЗАПУСК)
-# ==============================================================================
+        return frame
 
 def main():
-    print("------------------------------------------------")
-    print("   VECTOR GESTURE CONTROL | TITAN EDITION v8.0")
-    print("------------------------------------------------")
-    print(" GUIDE:")
-    print(" [1] ☝️ CURSOR:  Index Finger (Aim)")
-    print(" [2] 👌 CLICK:   Thumb + Middle Finger (Trigger)")
-    print(" [3] ✌️ SCROLL:  Victory Sign + Move Hand")
-    print(" [4] 👊 EXIT:    Hold Fist (2.5s)")
-    print("------------------------------------------------")
-
-    # Graceful Shutdown Handler
-    def shutdown_handler(sig, frame):
-        logger.info("Shutdown sequence initiated...")
-        cam.stop()
-        if engine.is_dragging: pyautogui.mouseUp()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
-    # Init Components
-    fps_meter = FPSMeter()
-    cam = CameraThread(src=config.CAMERA_ID)
-    engine = VectorEngine()
+    cap = cv2.VideoCapture(CAMERA_ID)
+    cap.set(3, WIDTH)
+    cap.set(4, HEIGHT)
     
-    # Warmup
-    logger.info("Warming up camera...")
-    time.sleep(1.0)
-    logger.info("System ACTIVE.")
+    brain = VectorBrain()
+    
+    print(f"--- VECTOR GESTURE CONTROL v9.0 STARTED ---")
+    print(f"Mode Default: COMPUTER (Use 👍 to switch)")
 
     try:
-        while True:
-            # 1. Get Frame (Threaded)
-            frame = cam.read()
-            if frame is None:
-                time.sleep(0.01)
-                continue
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
             
-            # 2. Process
-            engine.process(frame)
+            # Обработка
+            frame = brain.process_frame(frame)
             
-            # 3. Monitor
-            # fps = fps_meter.tick() 
-            # if fps > 0 and fps % 30 == 0: print(f"FPS: {fps}")
-
-    except Exception as e:
-        logger.critical(f"Runtime Crash: {e}", exc_info=True)
+            # Отрисовка (Опционально, для тестов. В проде можно убрать imshow)
+            # cv2.imshow('Vector Vision', frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
     finally:
-        cam.stop()
+        cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
