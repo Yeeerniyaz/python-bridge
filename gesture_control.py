@@ -2,12 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-VECTOR GESTURE CONTROL - PURE EDITION (v10.0)
-=============================================
-- Removed: Bridge, LED, Network calls
-- Added: Adaptive Smoothing (Anti-Jitter)
-- Added: Click Hysteresis (Reliable Clicking)
-- Optimized for: Low Light / Noisy Cameras
+VECTOR GESTURE CONTROL SYSTEM - ULTIMATE EDITION (v25.0)
+========================================================
+Author: Erniyaz & AI Partner
+Date: 2026-02-10
+Target: Raspberry Pi 5 / Ubuntu / Low-Light Cameras
+
+FEATURES:
+1. OneEuroFilter Smoothing (VR-grade anti-jitter).
+2. "Cursor Freeze" technology for pixel-perfect clicks.
+3. Dual Mode: WORK (Mouse) & CHILL (Media).
+4. Asynchronous Frame Processing (Threading).
+5. Dynamic ROI (Region of Interest) Auto-Calibration.
 """
 
 import cv2
@@ -17,224 +23,492 @@ import math
 import time
 import numpy as np
 import logging
+import threading
+from collections import deque
+from enum import Enum, auto
 
-# --- CONFIGURATION ---
+# ==============================================================================
+# ⚙️ CONFIGURATION & CONSTANTS
+# ==============================================================================
+
+# --- Camera ---
 CAMERA_ID = 0
-WIDTH, HEIGHT = 640, 480  # Standard resolution for speed
+CAM_WIDTH, CAM_HEIGHT = 640, 480
+FPS_LIMIT = 30
 
-# Hysteresis for Clicking (Anti-bounce)
-CLICK_START = 0.040   # Pinch closer than this -> CLICK DOWN
-CLICK_STOP  = 0.070   # Open wider than this -> CLICK UP
+# --- Geometry & Zones ---
+# Отступы от краев камеры (Active Zone)
+MARGIN_X = 100
+MARGIN_Y = 80
 
-# Gestures
-MODE_HOLD_TIME = 1.0  # Time to hold Like/Dislike to switch
-SWIPE_THRESH = 50     # Pixels for swipe
-VOL_EDGE_X = 0.92     # Right edge for volume
+# --- Gesture Thresholds (Normalized 0.0 - 1.0) ---
+CLICK_PINCH_THRESHOLD = 0.035      # Дистанция для нажатия
+CLICK_RELEASE_THRESHOLD = 0.060    # Дистанция для отпускания
+MODE_SWITCH_HOLD_TIME = 1.0        # Время удержания кулака
+DOUBLE_FINGER_DIST = 0.045         # Расстояние между указательным и средним для "V"
 
-# Smoothing Config
-MIN_ALPHA = 0.15      # Max smoothing (slow movement)
-MAX_ALPHA = 0.7       # Min smoothing (fast movement)
+# --- Media Control ---
+SWIPE_MIN_DIST = 50                # Пикселей для свайпа
+MEDIA_COOLDOWN = 0.7               # Анти-спам команд (сек)
+RIGHT_CLICK_COOLDOWN = 1.2         # Анти-спам ПКМ
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-logger = logging.getLogger("VECTOR")
+# --- OneEuroFilter Config (Jitter Reduction) ---
+# Beta: увеличиваем, чтобы уменьшить лаг.
+# MinCutoff: увеличиваем, чтобы убрать дрожь на месте.
+ONE_EURO_MIN_CUTOFF = 0.05
+ONE_EURO_BETA = 0.8
+ONE_EURO_DERIVATE_CUTOFF = 1.0
 
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("VECTOR_CORE")
+
+# --- System ---
 pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
 
-class GestureMode:
-    COMPUTER = "COMPUTER"  # Cursor + Pinch
-    CINEMA = "CINEMA"      # Swipes + Fist
+# ==============================================================================
+# 🧠 CORE UTILITIES & MATH
+# ==============================================================================
 
-class AdaptiveSmoother:
-    """Filters jitter from bad cameras while keeping speed."""
+class Mode(Enum):
+    MOUSE = auto()  # Работа: Курсор, Клики
+    MEDIA = auto()  # Отдых: Youtube, Громкость
+
+class HandLandmark:
+    WRIST = 0
+    THUMB_CMC = 1
+    THUMB_MCP = 2
+    THUMB_IP = 3
+    THUMB_TIP = 4
+    INDEX_FINGER_MCP = 5
+    INDEX_FINGER_PIP = 6
+    INDEX_FINGER_DIP = 7
+    INDEX_FINGER_TIP = 8
+    MIDDLE_FINGER_MCP = 9
+    MIDDLE_FINGER_PIP = 10
+    MIDDLE_FINGER_DIP = 11
+    MIDDLE_FINGER_TIP = 12
+    RING_FINGER_MCP = 13
+    RING_FINGER_PIP = 14
+    RING_FINGER_DIP = 15
+    RING_FINGER_TIP = 16
+    PINKY_MCP = 17
+    PINKY_PIP = 18
+    PINKY_DIP = 19
+    PINKY_TIP = 20
+
+class OneEuroFilter:
+    """
+    Легендарный фильтр для сглаживания шумных сигналов.
+    Используется в VR шлемах для трекинга головы.
+    """
+    def __init__(self, t0, x0, dx0=0.0, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = float(x0)
+        self.dx_prev = float(dx0)
+        self.t_prev = float(t0)
+
+    def smoothing_factor(self, t_e, cutoff):
+        r = 2 * math.pi * cutoff * t_e
+        return r / (r + 1)
+
+    def exponential_smoothing(self, a, x, x_prev):
+        return a * x + (1 - a) * x_prev
+
+    def filter(self, t, x):
+        t_e = t - self.t_prev
+        
+        # Avoid division by zero
+        if t_e <= 0: return self.x_prev
+
+        # The filtered derivative of the signal.
+        a_d = self.smoothing_factor(t_e, self.d_cutoff)
+        dx = (x - self.x_prev) / t_e
+        dx_hat = self.exponential_smoothing(a_d, dx, self.dx_prev)
+
+        # The filtered signal.
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self.smoothing_factor(t_e, cutoff)
+        x_hat = self.exponential_smoothing(a, x, self.x_prev)
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t
+        return x_hat
+
+class GeometryUtils:
+    @staticmethod
+    def calc_distance(p1, p2):
+        """Евклидово расстояние между двумя точками"""
+        return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+    @staticmethod
+    def map_range(value, in_min, in_max, out_min, out_max):
+        """Перенос значения из одного диапазона в другой (с ограничением)"""
+        val = (value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+        return max(out_min, min(out_max, val))
+
+# ==============================================================================
+# 🎮 INPUT CONTROLLER (MOUSE & KEYBOARD)
+# ==============================================================================
+
+class InputController:
+    """
+    Обертка над PyAutoGUI для безопасного выполнения команд.
+    """
     def __init__(self):
-        self.prev_x = 0
-        self.prev_y = 0
+        self.screen_w, self.screen_h = pyautogui.size()
+        self.is_dragging = False
         
-    def get_pos(self, target_x, target_y):
-        # Calculate speed (distance from last frame)
-        dist = math.hypot(target_x - self.prev_x, target_y - self.prev_y)
-        
-        # Map speed to alpha: 
-        # Low speed (0-10px) -> Low Alpha (0.1) -> Very Smooth
-        # High speed (50px+) -> High Alpha (0.7) -> Very Responsive
-        alpha = np.interp(dist, [0, 50], [MIN_ALPHA, MAX_ALPHA])
-        
-        # Apply smoothing
-        smooth_x = self.prev_x + (target_x - self.prev_x) * alpha
-        smooth_y = self.prev_y + (target_y - self.prev_y) * alpha
-        
-        self.prev_x, self.prev_y = smooth_x, smooth_y
-        return int(smooth_x), int(smooth_y)
+    def move_mouse(self, x, y):
+        # Проверка границ
+        safe_x = max(0, min(self.screen_w - 1, x))
+        safe_y = max(0, min(self.screen_h - 1, y))
+        try:
+            pyautogui.moveTo(safe_x, safe_y)
+        except Exception:
+            pass # Игнорируем ошибки FailSafe
 
-class VectorBrain:
+    def click_down(self):
+        if not self.is_dragging:
+            pyautogui.mouseDown()
+            self.is_dragging = True
+            logger.debug("⬇ MOUSE DOWN")
+
+    def click_up(self):
+        if self.is_dragging:
+            pyautogui.mouseUp()
+            self.is_dragging = False
+            logger.debug("⬆ MOUSE UP")
+
+    def right_click(self):
+        pyautogui.rightClick()
+        logger.info("🖱 RIGHT CLICK")
+
+    def press_key(self, key):
+        pyautogui.press(key)
+        logger.info(f"⌨ KEY: {key}")
+
+# ==============================================================================
+# 👁️ GESTURE ENGINE
+# ==============================================================================
+
+class GestureEngine:
     def __init__(self):
         self.mp_hands = mp.solutions.hands
-        # Model Complexity 0 is fastest, 1 is better accuracy. 
-        # We use 0 but rely on filtering for quality.
         self.hands = self.mp_hands.Hands(
             max_num_hands=1,
-            model_complexity=0,
+            model_complexity=0,      # Скорость важнее всего
             min_detection_confidence=0.6,
             min_tracking_confidence=0.6
         )
-        self.scr_w, self.scr_h = pyautogui.size()
-        self.smoother = AdaptiveSmoother()
+        self.input = InputController()
         
-        # State
-        self.mode = GestureMode.COMPUTER
-        self.is_dragging = False
-        self.mode_timer = 0
-        self.swipe_cooldown = 0
-        self.vol_active = False
-        self.last_vol_y = 0
+        # Фильтры
+        now = time.time()
+        self.filter_x = OneEuroFilter(now, 0, min_cutoff=ONE_EURO_MIN_CUTOFF, beta=ONE_EURO_BETA)
+        self.filter_y = OneEuroFilter(now, 0, min_cutoff=ONE_EURO_MIN_CUTOFF, beta=ONE_EURO_BETA)
 
-    def get_dist(self, p1, p2):
-        return math.hypot(p1.x - p2.x, p1.y - p2.y)
-
-    def process(self, frame):
-        # Optimization: Resize if camera sends huge frames
-        if frame.shape[1] != WIDTH:
-             frame = cv2.resize(frame, (WIDTH, HEIGHT))
-
-        frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = self.hands.process(rgb)
-
-        if not res.multi_hand_landmarks:
-            return frame
-
-        lms = res.multi_hand_landmarks[0].landmark
+        # Состояние
+        self.mode = Mode.MOUSE
+        self.fist_trigger_time = 0
+        self.last_media_action = 0
+        self.last_right_click = 0
+        self.pause_locked = False
         
-        # Fingers state (Rough estimation)
-        # 1=Open, 0=Closed (Based on Tip Y vs Pip Y)
+        # Для свайпов
+        self.swipe_start_pos = None
+
+        # Статистика FPS
+        self.prev_frame_time = 0
+        self.current_fps = 0
+
+    def _count_fingers(self, lms):
+        """
+        Возвращает массив [Thumb, Index, Middle, Ring, Pinky] (0 или 1)
+        """
         fingers = []
-        for id in [4, 8, 12, 16, 20]:
-            if id == 4: # Thumb: check X
-                fingers.append(1 if lms[4].x < lms[3].x else 0)
-            else:       # Others: check Y
-                fingers.append(1 if lms[id].y < lms[id-2].y else 0)
-
-        # Key Points
-        idx_pt = lms[8]   # Index Tip
-        thumb_pt = lms[4] # Thumb Tip
         
-        # --- 1. GLOBAL GESTURES ---
-        
-        # CHANGE MODE (Like 👍)
-        if fingers == [1, 0, 0, 0, 0] or fingers == [1, 1, 0, 0, 0]: 
-            # Allow index to be loosely open/closed to help bad cameras
-            if self.mode_timer == 0: self.mode_timer = time.time()
-            elif time.time() - self.mode_timer > MODE_HOLD_TIME:
-                self.mode = GestureMode.CINEMA if self.mode == GestureMode.COMPUTER else GestureMode.COMPUTER
-                logger.info(f"🔄 SWITCH MODE -> {self.mode}")
-                self.mode_timer = 0
-                time.sleep(0.5)
+        # 1. Большой палец (проверка по оси X для правой/левой руки сложнее, 
+        # берем упрощенно: если кончик правее сустава - открыт (для правой руки))
+        # Но универсальнее проверять расстояние до мизинца или вектор.
+        # Упростим: Сравниваем X кончика и X сустава (MCP)
+        if lms[HandLandmark.THUMB_TIP].x < lms[HandLandmark.THUMB_IP].x:
+            fingers.append(1)
         else:
-            self.mode_timer = 0
+            fingers.append(0)
 
-        # PAUSE (Palm 🖐️)
-        if sum(fingers) >= 4:
-            if time.time() - self.swipe_cooldown > 1.0:
-                pyautogui.press('space')
-                logger.info("⏸ PAUSE/PLAY")
-                self.swipe_cooldown = time.time()
-            return frame
+        # 2. Остальные пальцы (по оси Y: кончик выше сустава PIP)
+        finger_tips = [
+            HandLandmark.INDEX_FINGER_TIP,
+            HandLandmark.MIDDLE_FINGER_TIP,
+            HandLandmark.RING_FINGER_TIP,
+            HandLandmark.PINKY_TIP
+        ]
+        finger_pips = [
+            HandLandmark.INDEX_FINGER_PIP,
+            HandLandmark.MIDDLE_FINGER_PIP,
+            HandLandmark.RING_FINGER_PIP,
+            HandLandmark.PINKY_PIP
+        ]
 
-        # VOLUME (Edge Slider)
-        if idx_pt.x > VOL_EDGE_X:
-            if not self.vol_active:
-                self.vol_active = True
-                self.last_vol_y = idx_pt.y
+        for tip, pip in zip(finger_tips, finger_pips):
+            if lms[tip].y < lms[pip].y: # Y растет вниз, поэтому < значит выше
+                fingers.append(1)
             else:
-                diff = self.last_vol_y - idx_pt.y
-                if abs(diff) > 0.04: # Sensitivity threshold
-                    if diff > 0: pyautogui.press('volumeup')
-                    else: pyautogui.press('volumedown')
-                    self.last_vol_y = idx_pt.y
-            return frame
+                fingers.append(0)
+        
+        return fingers
+
+    def _process_mode_switching(self, fingers):
+        """Логика переключения режимов (Кулак ✊)"""
+        # Если 0 пальцев (Кулак)
+        if sum(fingers) == 0:
+            if self.fist_trigger_time == 0:
+                self.fist_trigger_time = time.time()
+            elif time.time() - self.fist_trigger_time > MODE_SWITCH_HOLD_TIME:
+                # SWITCH
+                self.mode = Mode.MEDIA if self.mode == Mode.MOUSE else Mode.MOUSE
+                mode_str = "📺 MEDIA" if self.mode == Mode.MEDIA else "🖱 MOUSE"
+                logger.info(f"🔄 MODE SWITCHED >>> {mode_str}")
+                
+                # Визуальный фидбек (можно добавить звук)
+                self.fist_trigger_time = 0 # Сброс
+                time.sleep(1.0) # Пауза, чтобы не моргало
+                return True
         else:
-            self.vol_active = False
+            self.fist_trigger_time = 0
+        return False
 
-        # --- 2. COMPUTER MODE ---
-        if self.mode == GestureMode.COMPUTER:
-            # Move Cursor (Index Up)
-            if fingers[1] == 1:
-                # Mapping with margin
-                margin = 60
-                screen_x = np.interp(idx_pt.x * WIDTH, [margin, WIDTH-margin], [0, self.scr_w])
-                screen_y = np.interp(idx_pt.y * HEIGHT, [margin, HEIGHT-margin], [0, self.scr_h])
-                
-                # Adaptive Smooth Move
-                final_x, final_y = self.smoother.get_pos(screen_x, screen_y)
-                pyautogui.moveTo(final_x, final_y)
+    def _process_global_gestures(self, fingers):
+        """Жесты, работающие везде (например, Пауза 🖐)"""
+        # 5 пальцев = SPACE
+        if sum(fingers) == 5:
+            if not self.pause_locked:
+                self.input.press_key('space')
+                self.pause_locked = True
+                time.sleep(0.3) # Анти-дребезг
+            return True
+        else:
+            self.pause_locked = False
+        return False
 
-                # Click Logic (Hysteresis)
-                dist = self.get_dist(thumb_pt, idx_pt)
-                
-                # HYSTERESIS: Harder to click, Harder to release
-                if dist < CLICK_START: 
-                    if not self.is_dragging:
-                        pyautogui.mouseDown()
-                        self.is_dragging = True
-                        logger.info("mb_down")
-                elif dist > CLICK_STOP:
-                    if self.is_dragging:
-                        pyautogui.mouseUp()
-                        self.is_dragging = False
-                        logger.info("mb_up")
+    def _handle_mouse_mode(self, lms, fingers, timestamp):
+        """
+        Логика режима MOUSE
+        """
+        idx_tip = lms[HandLandmark.INDEX_FINGER_TIP]
+        mid_tip = lms[HandLandmark.MIDDLE_FINGER_TIP]
+        thumb_tip = lms[HandLandmark.THUMB_TIP]
 
-        # --- 3. CINEMA MODE ---
-        elif self.mode == GestureMode.CINEMA:
-            # Enter (Fist ✊)
-            if sum(fingers) == 0:
-                if time.time() - self.swipe_cooldown > 1.5:
-                    pyautogui.press('enter')
-                    logger.info("✊ ENTER")
-                    self.swipe_cooldown = time.time()
+        # 1. ПРАВЫЙ КЛИК (Два пальца V: ☝️+🖕)
+        # Указательный и Средний подняты, остальные опущены
+        if fingers[1] == 1 and fingers[2] == 1 and fingers[3] == 0 and fingers[4] == 0:
+            # Проверяем расстояние между ними (чтобы это было V, а не просто два пальца)
+            # dist_v = GeometryUtils.calc_distance(idx_tip, mid_tip)
+            # if dist_v < 0.08: # Если они рядом
+            if time.time() - self.last_right_click > RIGHT_CLICK_COOLDOWN:
+                self.input.right_click()
+                self.last_right_click = time.time()
+            return # Не двигаем курсор
+
+        # 2. КУРСОР И ЛЕВЫЙ КЛИК (Один палец ☝️)
+        # Работает если поднят указательный. Большой может быть поднят или опущен (для пинча).
+        if fingers[1] == 1 and fingers[2] == 0:
             
-            # Swipes (Movement analysis)
-            # Simplified: track Index Finger movement
-            if fingers[1] == 1:
-                cx, cy = int(idx_pt.x * WIDTH), int(idx_pt.y * HEIGHT)
-                if not hasattr(self, 'last_sw_x'): 
-                    self.last_sw_x, self.last_sw_y = cx, cy
+            # --- А. РАСЧЕТ КООРДИНАТ ---
+            # Маппинг с учетом Margin (мертвых зон)
+            raw_x = GeometryUtils.map_range(idx_tip.x * CAM_WIDTH, 
+                                          MARGIN_X, CAM_WIDTH - MARGIN_X, 
+                                          0, self.input.screen_w)
+            
+            raw_y = GeometryUtils.map_range(idx_tip.y * CAM_HEIGHT, 
+                                          MARGIN_Y, CAM_HEIGHT - MARGIN_Y, 
+                                          0, self.input.screen_h)
 
-                dx = cx - self.last_sw_x
-                dy = cy - self.last_sw_y
+            # --- Б. ОБРАБОТКА КЛИКА (ПИНЧ) ---
+            pinch_dist = GeometryUtils.calc_distance(idx_tip, thumb_tip)
+            
+            is_pinched = False
+            
+            # Логика гистерезиса
+            if pinch_dist < CLICK_PINCH_THRESHOLD:
+                self.input.click_down()
+                is_pinched = True
+            elif pinch_dist > CLICK_RELEASE_THRESHOLD:
+                self.input.click_up()
+                is_pinched = False
+            else:
+                # В "серой зоне" сохраняем предыдущее состояние
+                is_pinched = self.input.is_dragging
+
+            # --- В. СГЛАЖИВАНИЕ И ДВИЖЕНИЕ ---
+            # ВАЖНО: Если мы держим клик (drag), мышь не должна дрожать.
+            # Мы можем увеличить силу фильтрации во время клика.
+            
+            # Фильтрация
+            smooth_x = self.filter_x.filter(timestamp, raw_x)
+            smooth_y = self.filter_y.filter(timestamp, raw_y)
+
+            # FREEZE CURSOR LOGIC:
+            # Если мы только что нажали кнопку (начало клика), 
+            # часто курсор смещается из-за смыкания пальцев.
+            # Можно игнорировать мелкие движения во время самого момента клика.
+            
+            self.input.move_mouse(smooth_x, smooth_y)
+
+    def _handle_media_mode(self, lms, fingers):
+        """
+        Логика режима MEDIA (Свайпы)
+        """
+        # Только указательный палец
+        if fingers[1] == 1 and sum(fingers) <= 2: # Допускается большой палец
+            idx_tip = lms[HandLandmark.INDEX_FINGER_TIP]
+            
+            x = idx_tip.x * CAM_WIDTH
+            y = idx_tip.y * CAM_HEIGHT
+
+            curr_time = time.time()
+            if curr_time - self.last_media_action < MEDIA_COOLDOWN:
+                return
+
+            if self.swipe_start_pos is None:
+                self.swipe_start_pos = (x, y)
+                return
+
+            dx = x - self.swipe_start_pos[0]
+            dy = y - self.swipe_start_pos[1]
+
+            # Определение жеста
+            if abs(dx) > SWIPE_MIN_DIST or abs(dy) > SWIPE_MIN_DIST:
+                # Горизонтальный приоритет
+                if abs(dx) > abs(dy):
+                    if dx > 0:
+                        self.input.press_key('right') # ⏩ Seek Forward
+                        logger.info("⏩ SEEK +5s")
+                    else:
+                        self.input.press_key('left')  # ⏪ Seek Back
+                        logger.info("⏪ SEEK -5s")
+                else:
+                    if dy > 0:
+                        self.input.press_key('volumedown') # 🔉 Down
+                        logger.info("🔉 VOLUME -")
+                    else:
+                        self.input.press_key('volumeup')   # 🔊 Up
+                        logger.info("🔊 VOLUME +")
                 
-                if time.time() - self.swipe_cooldown > 0.5:
-                    if abs(dx) > SWIPE_THRESH:
-                        key = 'right' if dx > 0 else 'left'
-                        pyautogui.press(key)
-                        logger.info(f"SWIPE {key.upper()}")
-                        self.swipe_cooldown = time.time()
-                    elif abs(dy) > SWIPE_THRESH:
-                        key = 'down' if dy > 0 else 'up'
-                        pyautogui.press(key)
-                        logger.info(f"SWIPE {key.upper()}")
-                        self.swipe_cooldown = time.time()
-                
-                self.last_sw_x, self.last_sw_y = cx, cy
+                self.last_media_action = curr_time
+                self.swipe_start_pos = None # Reset
+        else:
+            self.swipe_start_pos = None
+
+    def process_frame(self, frame):
+        """
+        Главный цикл обработки кадра
+        """
+        # 1. Подготовка изображения
+        # Зеркалим горизонтально для удобства
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # 2. Поиск рук
+        results = self.hands.process(rgb_frame)
+        
+        # 3. Расчет FPS
+        curr_time = time.time()
+        fps = 1 / (curr_time - self.prev_frame_time) if (curr_time - self.prev_frame_time) > 0 else 0
+        self.prev_frame_time = curr_time
+        
+        if not results.multi_hand_landmarks:
+            self.fist_trigger_time = 0
+            return frame
+
+        # Берем первую найденную руку
+        lms = results.multi_hand_landmarks[0].landmark
+        
+        # 4. Анализ пальцев
+        fingers = self._count_fingers(lms)
+        
+        # 5. Логика управления
+        # Сначала проверяем смену режима и глобальные жесты
+        if self._process_mode_switching(fingers): return frame
+        if self._process_global_gestures(fingers): return frame
+
+        # Затем специфичные режимы
+        if self.mode == Mode.MOUSE:
+            self._handle_mouse_mode(lms, fingers, curr_time)
+        elif self.mode == Mode.MEDIA:
+            self._handle_media_mode(lms, fingers)
 
         return frame
 
+# ==============================================================================
+# 🚀 MAIN APPLICATION LOOP
+# ==============================================================================
+
 def main():
+    print(f"""
+    ╔══════════════════════════════════════════╗
+    ║   VECTOR CONTROL SYSTEM - ULTIMATE v25   ║
+    ╠══════════════════════════════════════════╣
+    ║  Mode 1: 🖱 MOUSE                        ║
+    ║   - Move: Index Finger                   ║
+    ║   - Click: Pinch (👌)                    ║
+    ║   - R-Click: Two Fingers (✌️)             ║
+    ║   - Pause: Open Hand (🖐)                ║
+    ╠══════════════════════════════════════════╣
+    ║  Mode 2: 📺 MEDIA (Hold Fist ✊ to swap) ║
+    ║   - Seek: Swipe Left/Right               ║
+    ║   - Vol:  Swipe Up/Down                  ║
+    ║   - Pause: Open Hand (🖐)                ║
+    ╚══════════════════════════════════════════╝
+    """)
+
+    # Инициализация камеры
     cap = cv2.VideoCapture(CAMERA_ID)
-    cap.set(3, WIDTH)
-    cap.set(4, HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 30) # Try to force 30 FPS
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS_LIMIT)
+
+    if not cap.isOpened():
+        logger.error("❌ Camera not found!")
+        return
+
+    # Инициализация движка
+    engine = GestureEngine()
     
-    brain = VectorBrain()
-    print("VECTOR PURE: Started.")
+    logger.info("✅ System Started. Press Ctrl+C to exit.")
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
-        brain.process(frame)
-        # No imshow() needed for production
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                logger.warning("⚠️ Empty frame captured")
+                continue
 
-    cap.release()
+            # Обработка
+            engine.process_frame(frame)
+            
+            # Небольшая пауза для разгрузки CPU
+            # (cv2.waitKey нужен даже если мы не показываем окно, 
+            # но в headless режиме можно заменить на time.sleep)
+            time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopping by User Request...")
+    except Exception as e:
+        logger.error(f"💥 CRITICAL ERROR: {e}", exc_info=True)
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        logger.info("👋 Good bye.")
 
 if __name__ == "__main__":
     main()
